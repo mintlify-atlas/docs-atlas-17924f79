@@ -1,0 +1,490 @@
+---
+title: Debugging
+description: Learn how to debug your Stardust shellcode
+---
+
+Stardust provides debugging capabilities through the `DBG_PRINTF` macro and Windows DbgPrint API. This guide shows you how to debug your shellcode effectively.
+
+## Debug Mode
+
+### Enabling Debug Mode
+
+Compile with debug symbols enabled:
+
+```bash
+make debug
+```
+
+This adds the `-D DEBUG` compiler flag, which:
+- Enables the `DBG_PRINTF` macro
+- Resolves `ntdll.DbgPrint` API
+- Includes debug strings in the binary
+- Increases binary size
+
+### Build Output Comparison
+
+**Release mode** (`make`):
+```bash
+$ make
+...
+$ ll bin
+.rw-r--r-- spider spider 752 B  stardust.x64.bin
+.rw-r--r-- spider spider 672 B  stardust.x86.bin
+```
+
+**Debug mode** (`make debug`):
+```bash
+$ make debug
+...
+$ ll bin
+.rw-r--r-- spider spider 1.2 KB  stardust.x64.bin
+.rw-r--r-- spider spider 1.1 KB  stardust.x86.bin
+```
+
+Debug builds are ~40-60% larger due to debug strings.
+
+## The DBG_PRINTF Macro
+
+### Definition
+
+The `DBG_PRINTF` macro is defined in `include/common.h`:
+
+```cpp include/common.h
+#if defined( DEBUG )
+#define DBG_PRINTF( format, ... ) { ntdll.DbgPrint( symbol<PCH>( "[DEBUG::%s::%d] " format ), symbol<PCH>( __FUNCTION__ ), __LINE__, ##__VA_ARGS__ ); }
+#else
+#define DBG_PRINTF( format, ... ) { ; }
+#endif
+```
+
+In debug mode:
+- Calls `ntdll.DbgPrint` with formatted output
+- Prepends `[DEBUG::function::line]` prefix
+- Uses `symbol()` for position-independent strings
+- Supports printf-style formatting
+
+In release mode:
+- Compiles to no-op (empty statement)
+- Zero overhead
+- No strings in binary
+
+### DbgPrint API Resolution
+
+In debug mode, `ntdll.DbgPrint` is automatically resolved:
+
+```cpp include/common.h
+struct {
+    uintptr_t handle;
+
+    struct
+    {
+#ifdef DEBUG
+        D_API( DbgPrint )
+#endif
+    };
+} ntdll = {
+#ifdef DEBUG
+    RESOLVE_TYPE( DbgPrint )
+#endif
+};
+```
+
+## Using DBG_PRINTF
+
+### Basic Usage
+
+```cpp
+DBG_PRINTF( "Simple message\n" );
+DBG_PRINTF( "Value: %d\n", 42 );
+DBG_PRINTF( "Pointer: %p\n", ptr );
+DBG_PRINTF( "String: %s\n", "hello" );
+```
+
+### Formatting Specifiers
+
+Supports standard printf format specifiers:
+
+```cpp
+DBG_PRINTF( "Integer: %d\n", 123 );           // Decimal
+DBG_PRINTF( "Hex: 0x%x\n", 0xDEADBEEF );      // Hexadecimal
+DBG_PRINTF( "Pointer: %p\n", ptr );           // Pointer
+DBG_PRINTF( "String: %s\n", str );            // Narrow string
+DBG_PRINTF( "Wide: %ls\n", wstr );            // Wide string
+DBG_PRINTF( "Unsigned: %lu\n", ul );          // Unsigned long
+DBG_PRINTF( "Long long: %lld\n", ll );        // Long long
+```
+
+### Real Examples from main.cc
+
+#### Loading a Module
+
+```cpp src/main.cc
+const auto user32 = kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+
+if ( user32 ) {
+    DBG_PRINTF( "oh wow look we loaded user32.dll -> %p\n", user32 );
+} else {
+    DBG_PRINTF( "okay something went wrong. failed to load user32 :/\n" );
+}
+```
+
+Output:
+```
+[DEBUG::start::48] oh wow look we loaded user32.dll -> 00007FFE12340000
+```
+
+#### Process Information
+
+```cpp src/main.cc
+DBG_PRINTF( "running from %ls (Pid: %d)\n",
+    NtCurrentPeb()->ProcessParameters->ImagePathName.Buffer,
+    NtCurrentTeb()->ClientId.UniqueProcess );
+```
+
+Output:
+```
+[DEBUG::start::53] running from C:\Windows\System32\notepad.exe (Pid: 1234)
+```
+
+#### Shellcode Metadata
+
+```cpp src/main.cc
+DBG_PRINTF( "shellcode @ %p [%d bytes]\n", base.address, base.length );
+```
+
+Output:
+```
+[DEBUG::start::57] shellcode @ 0000000000401000 [752 bytes]
+```
+
+## Viewing Debug Output
+
+### Using DebugView
+
+1. **Download DebugView**:
+   - Get from [Sysinternals](https://docs.microsoft.com/en-us/sysinternals/downloads/debugview)
+   - Free tool from Microsoft
+
+2. **Run DebugView**:
+   ```bash
+   Dbgview.exe
+   ```
+
+3. **Enable Kernel Capture**:
+   - Capture → Capture Kernel
+   - Capture → Capture Global Win32
+
+4. **Run Your Shellcode**:
+   ```bash
+   test/stomper.x64.exe bin/stardust.x64.bin
+   ```
+
+5. **View Output**:
+   Debug messages appear in real-time in DebugView
+
+### Example DebugView Output
+
+```
+[1234] [DEBUG::start::48] oh wow look we loaded user32.dll -> 00007FFE12340000
+[1234] [DEBUG::start::53] running from C:\Windows\System32\notepad.exe (Pid: 1234)
+[1234] [DEBUG::start::57] shellcode @ 0000000000401000 [752 bytes]
+```
+
+### Using WinDbg
+
+You can also view DbgPrint output in WinDbg:
+
+```
+kd> ed nt!Kd_DEFAULT_Mask 0xFFFFFFFF
+```
+
+This enables all debug output.
+
+## Common Debugging Scenarios
+
+### Debugging API Resolution
+
+```cpp
+auto declfn instance::start(
+    _In_ void* arg
+) -> void {
+    DBG_PRINTF( "Starting shellcode\n" );
+    
+    const auto user32 = kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+    
+    if ( !user32 ) {
+        DBG_PRINTF( "Failed to load user32.dll\n" );
+        return;
+    }
+    
+    DBG_PRINTF( "user32.dll loaded at %p\n", user32 );
+    
+    decltype( MessageBoxA ) * msgbox = RESOLVE_API( 
+        reinterpret_cast<uintptr_t>( user32 ), 
+        MessageBoxA 
+    );
+    
+    if ( !msgbox ) {
+        DBG_PRINTF( "Failed to resolve MessageBoxA\n" );
+        return;
+    }
+    
+    DBG_PRINTF( "MessageBoxA resolved at %p\n", msgbox );
+    
+    msgbox( nullptr, symbol<const char*>( "Test" ), symbol<const char*>( "Test" ), MB_OK );
+    
+    DBG_PRINTF( "MessageBoxA executed successfully\n" );
+}
+```
+
+### Debugging Module Resolution
+
+Add debug output to the constructor:
+
+```cpp src/main.cc
+declfn instance::instance(void) {
+    // Calculate the shellcode base address + size
+    base.address = RipStart();
+    base.length  = ( RipData() - base.address ) + END_OFFSET;
+    
+    DBG_PRINTF( "Shellcode base: %p, length: %d\n", base.address, base.length );
+    
+    // Load modules from PEB
+    if ( ! (( ntdll.handle = resolve::module( expr::hash_string<wchar_t>( L"ntdll.dll" ) ) )) ) {
+        DBG_PRINTF( "Failed to resolve ntdll.dll\n" );
+        return;
+    }
+    DBG_PRINTF( "ntdll.dll @ %p\n", ntdll.handle );
+    
+    if ( ! (( kernel32.handle = resolve::module( expr::hash_string<wchar_t>( L"kernel32.dll" ) ) )) ) {
+        DBG_PRINTF( "Failed to resolve kernel32.dll\n" );
+        return;
+    }
+    DBG_PRINTF( "kernel32.dll @ %p\n", kernel32.handle );
+    
+    // Resolve imports
+    RESOLVE_IMPORT( ntdll );
+    DBG_PRINTF( "Resolved ntdll imports\n" );
+    
+    RESOLVE_IMPORT( kernel32 );
+    DBG_PRINTF( "Resolved kernel32 imports\n" );
+}
+```
+
+### Debugging String Issues
+
+Check if strings are correctly resolved:
+
+```cpp
+const char* test_str = symbol<const char*>( "test" );
+DBG_PRINTF( "String address: %p, value: %s\n", test_str, test_str );
+```
+
+### Debugging Memory Issues
+
+```cpp
+DBG_PRINTF( "Allocating memory...\n" );
+LPVOID ptr = VirtualAlloc( NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE );
+
+if ( !ptr ) {
+    DBG_PRINTF( "VirtualAlloc failed: %lu\n", GetLastError() );
+    return;
+}
+
+DBG_PRINTF( "Allocated memory at %p\n", ptr );
+
+// Use memory...
+
+DBG_PRINTF( "Freeing memory...\n" );
+VirtualFree( ptr, 0, MEM_RELEASE );
+DBG_PRINTF( "Memory freed\n" );
+```
+
+## Debug vs Release Differences
+
+### Code Size
+
+| Build | x64 Size | x86 Size |
+|-------|----------|----------|
+| Release | ~750 bytes | ~670 bytes |
+| Debug | ~1200 bytes | ~1100 bytes |
+
+### Performance
+
+- Debug builds have minimal performance impact
+- `DBG_PRINTF` calls add slight overhead
+- String formatting takes CPU cycles
+
+### Features
+
+| Feature | Release | Debug |
+|---------|---------|-------|
+| `DBG_PRINTF` | No-op | Active |
+| `ntdll.DbgPrint` | Not resolved | Resolved |
+| Debug strings | Excluded | Included |
+| Binary size | Minimal | Larger |
+| Evasion | Better | Worse |
+
+## Advanced Debugging
+
+### Conditional Debug Output
+
+Add custom debug macros:
+
+```cpp
+#ifdef DEBUG
+#define DBG_VERBOSE( format, ... ) DBG_PRINTF( "[VERBOSE] " format, ##__VA_ARGS__ )
+#define DBG_ERROR( format, ... ) DBG_PRINTF( "[ERROR] " format, ##__VA_ARGS__ )
+#else
+#define DBG_VERBOSE( format, ... ) { ; }
+#define DBG_ERROR( format, ... ) { ; }
+#endif
+```
+
+Usage:
+```cpp
+DBG_VERBOSE( "Entering function\n" );
+DBG_ERROR( "Critical error occurred: %d\n", error_code );
+```
+
+### Debug Levels
+
+Implement debug levels:
+
+```cpp
+#ifdef DEBUG
+#define DEBUG_LEVEL 2
+
+#define DBG_L1( format, ... ) if ( DEBUG_LEVEL >= 1 ) DBG_PRINTF( format, ##__VA_ARGS__ )
+#define DBG_L2( format, ... ) if ( DEBUG_LEVEL >= 2 ) DBG_PRINTF( format, ##__VA_ARGS__ )
+#define DBG_L3( format, ... ) if ( DEBUG_LEVEL >= 3 ) DBG_PRINTF( format, ##__VA_ARGS__ )
+#else
+#define DBG_L1( format, ... ) { ; }
+#define DBG_L2( format, ... ) { ; }
+#define DBG_L3( format, ... ) { ; }
+#endif
+```
+
+### Hex Dump Function
+
+Create a debug hex dump helper:
+
+```cpp
+#ifdef DEBUG
+void declfn hex_dump( void* data, size_t size ) {
+    unsigned char* bytes = static_cast<unsigned char*>( data );
+    for ( size_t i = 0; i < size; i += 16 ) {
+        DBG_PRINTF( "%04zx: ", i );
+        for ( size_t j = 0; j < 16; j++ ) {
+            if ( i + j < size ) {
+                DBG_PRINTF( "%02x ", bytes[i + j] );
+            } else {
+                DBG_PRINTF( "   " );
+            }
+        }
+        DBG_PRINTF( "\n" );
+    }
+}
+#endif
+```
+
+## Troubleshooting
+
+### No Debug Output
+
+**Problem**: No output in DebugView
+
+**Solutions**:
+1. Ensure compiled with `make debug` (not `make`)
+2. Check DebugView is capturing kernel messages
+3. Run DebugView as Administrator
+4. Verify `ntdll.DbgPrint` resolved successfully
+5. Check shellcode is actually executing
+
+### Garbled Output
+
+**Problem**: Debug output shows garbage characters
+
+**Solutions**:
+1. Ensure using `symbol()` for all string literals
+2. Check format specifiers match argument types
+3. Verify null-terminated strings
+4. Check for buffer overflows
+
+### Missing Debug Symbols
+
+**Problem**: Function names missing from output
+
+**Solutions**:
+1. Compile with debug mode: `make debug`
+2. Check `__FUNCTION__` macro is supported
+3. Verify compiler flags include debug info
+
+### Crashes with Debug Build
+
+**Problem**: Shellcode crashes only in debug mode
+
+**Possible causes**:
+1. Stack space exhausted by debug strings
+2. Debug string references not position-independent
+3. `symbol()` not used for debug format strings
+
+**Solution**: The `DBG_PRINTF` macro already uses `symbol()` internally, so this should be rare.
+
+## Best Practices
+
+### 1. Always Use symbol() in DBG_PRINTF
+
+The macro handles this for you, but if you create custom debug macros:
+
+```cpp
+// Good - macro uses symbol() internally
+DBG_PRINTF( "Message: %s\n", my_string );
+
+// Bad - if creating custom macro without symbol()
+#define MY_DBG( fmt ) ntdll.DbgPrint( fmt )  // Missing symbol()!
+```
+
+### 2. Remove Debug Output for Production
+
+Always build release mode for production:
+
+```bash
+make        # Production
+make debug  # Development only
+```
+
+### 3. Check Resolution Before Use
+
+```cpp
+if ( !kernel32.LoadLibraryA ) {
+    DBG_PRINTF( "LoadLibraryA not resolved!\n" );
+    return;
+}
+```
+
+### 4. Use Meaningful Messages
+
+```cpp
+// Good
+DBG_PRINTF( "Failed to resolve MessageBoxA (error: %lu)\n", GetLastError() );
+
+// Bad
+DBG_PRINTF( "Error\n" );
+```
+
+### 5. Include Context
+
+The `DBG_PRINTF` macro automatically includes function name and line number:
+
+```
+[DEBUG::start::48] Message here
+         ^     ^    ^
+     function  line  your message
+```
+
+## Next Steps
+
+- [Creating Custom Shellcode](/guides/creating-shellcode)
+- [Adding New APIs](/guides/adding-apis)
+- [Module Stomping](/guides/module-stomping)

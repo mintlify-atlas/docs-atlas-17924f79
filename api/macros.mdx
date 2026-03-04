@@ -1,0 +1,544 @@
+---
+title: 'Macros'
+description: 'Preprocessor macros for API resolution, batch operations, and code organization'
+---
+
+Stardust provides several preprocessor macros that simplify common shellcode patterns, including API pointer declarations, batch resolution, and linked list iteration.
+
+---
+
+## D_API()
+
+Declares a function pointer with automatic type inference from an existing symbol.
+
+```cpp
+#define D_API(x) decltype(x) * x;
+```
+
+<ParamField path="x" type="symbol">
+  Name of an existing function or symbol to create a typed pointer for.
+</ParamField>
+
+### Purpose
+
+This macro uses `decltype` to automatically infer the function signature type, creating a pointer variable with the same name. It's primarily used for declaring API function pointers in structures.
+
+### Example Usage
+
+```cpp
+// Instead of manually typing signatures:
+HMODULE (WINAPI *LoadLibraryA)(LPCSTR);
+FARPROC (WINAPI *GetProcAddress)(HMODULE, LPCSTR);
+
+// Use D_API for automatic type inference:
+struct Kernel32 {
+    uintptr_t handle;
+    
+    D_API(LoadLibraryA)      // Expands to: decltype(LoadLibraryA) * LoadLibraryA;
+    D_API(GetProcAddress)    // Expands to: decltype(GetProcAddress) * GetProcAddress;
+    D_API(VirtualAlloc)
+    D_API(VirtualProtect)
+};
+```
+
+### Benefits
+
+- **Type Safety:** Automatically matches the correct signature
+- **Maintainability:** No need to manually write complex function pointer types
+- **Consistency:** Ensures pointer types match Windows API declarations
+- **Readability:** Clean, concise syntax
+
+### Complete Example
+
+```cpp
+struct {
+    uintptr_t handle;
+    
+    struct {
+        D_API(LoadLibraryA)
+        D_API(GetProcAddress)
+        D_API(VirtualAlloc)
+    };
+} kernel32 = {
+    RESOLVE_TYPE(LoadLibraryA),
+    RESOLVE_TYPE(GetProcAddress),
+    RESOLVE_TYPE(VirtualAlloc)
+};
+
+// After RESOLVE_IMPORT(kernel32), use like normal functions:
+auto user32 = kernel32.LoadLibraryA("user32.dll");
+```
+
+<Tip>
+  Combine `D_API()` with `RESOLVE_TYPE()` and `RESOLVE_IMPORT()` for a complete batch API resolution pattern.
+</Tip>
+
+---
+
+## RESOLVE_TYPE()
+
+Initializes structure members with compile-time hash values for batch API resolution.
+
+```cpp
+#define RESOLVE_TYPE(s) .s = reinterpret_cast<decltype(s)*>(expr::hash_string(#s))
+```
+
+<ParamField path="s" type="symbol">
+  Function name to hash. The macro stringifies the symbol, computes its compile-time hash, and assigns it to the corresponding structure member.
+</ParamField>
+
+### Purpose
+
+This macro prepares structure members for batch resolution by storing hash values instead of actual function pointers. The hashes are later resolved to real addresses by `RESOLVE_IMPORT()`.
+
+### Expansion Example
+
+```cpp
+// Source:
+RESOLVE_TYPE(LoadLibraryA)
+
+// Expands to:
+.LoadLibraryA = reinterpret_cast<decltype(LoadLibraryA)*>(
+    expr::hash_string("LoadLibraryA")
+)
+```
+
+### Usage Pattern
+
+```cpp
+struct {
+    uintptr_t handle;
+    
+    struct {
+        D_API(DbgPrint)
+        D_API(RtlAllocateHeap)
+        D_API(RtlFreeHeap)
+    };
+} ntdll = {
+    RESOLVE_TYPE(DbgPrint),
+    RESOLVE_TYPE(RtlAllocateHeap),
+    RESOLVE_TYPE(RtlFreeHeap)
+};
+```
+
+### How It Works
+
+1. `#s` stringifies the symbol name (e.g., `"LoadLibraryA"`)
+2. `expr::hash_string()` computes the FNV-1a hash at compile-time
+3. The hash is cast to a pointer type matching the function signature
+4. The pointer (containing the hash) is assigned to the structure member
+5. Later, `RESOLVE_IMPORT()` replaces these hash values with actual addresses
+
+<Info>
+  The designated initializer syntax (`.member = value`) allows initializing nested anonymous structures in the correct order.
+</Info>
+
+---
+
+## RESOLVE_API()
+
+Convenience macro that combines hash computation and typed API resolution in a single call.
+
+```cpp
+#define RESOLVE_API(m, s) resolve::api<decltype(s)>(m, expr::hash_string(#s))
+```
+
+<ParamField path="m" type="uintptr_t">
+  Module base address to resolve the API from.
+</ParamField>
+
+<ParamField path="s" type="symbol">
+  Function name to resolve (unquoted). The macro automatically computes its hash and casts the result.
+</ParamField>
+
+### Example Usage
+
+```cpp
+// Resolve individual APIs
+auto user32 = kernel32.LoadLibraryA("user32.dll");
+auto user32_base = reinterpret_cast<uintptr_t>(user32);
+
+// Instead of:
+auto msgbox_hash = expr::hash_string("MessageBoxA");
+auto msgbox = resolve::api<decltype(MessageBoxA)>(user32_base, msgbox_hash);
+
+// Use RESOLVE_API:
+decltype(MessageBoxA)* msgbox = RESOLVE_API(user32_base, MessageBoxA);
+
+// Call the function
+msgbox(
+    nullptr,
+    symbol<const char*>("Hello!"),
+    symbol<const char*>("Title"),
+    MB_OK
+);
+```
+
+### When to Use
+
+**Use `RESOLVE_API()` for:**
+- Single API resolution
+- Dynamically loaded modules (via LoadLibraryA)
+- One-off function lookups
+
+**Use `RESOLVE_IMPORT()` for:**
+- Batch resolution of multiple APIs
+- Static module resolution (ntdll, kernel32)
+- Organized API structure management
+
+<Tip>
+  `RESOLVE_API()` is ideal for runtime-loaded modules where you don't know the module address until after calling `LoadLibraryA`.
+</Tip>
+
+---
+
+## RESOLVE_IMPORT()
+
+Batch resolves all API function pointers in a structure using stored hash values.
+
+```cpp
+#define RESOLVE_IMPORT(m) { \
+    for (int i = 1; i < expr::struct_count<decltype(instance::m)>(); i++) { \
+        reinterpret_cast<uintptr_t*>(&m)[i] = resolve::_api(m.handle, reinterpret_cast<uintptr_t*>(&m)[i]); \
+    } \
+}
+```
+
+<ParamField path="m" type="structure">
+  Name of the API structure to resolve. Must contain a `handle` member as the first field, followed by function pointers declared with `D_API()`.
+</ParamField>
+
+### How It Works
+
+1. **Count Members:** Uses `expr::struct_count()` to determine how many pointers are in the structure
+2. **Skip First Member:** Loop starts at index `1` to skip the `handle` field
+3. **Array Indexing:** Treats the structure as an array of `uintptr_t` pointers
+4. **Hash to Address:** For each member, calls `resolve::_api()` with:
+   - `m.handle` - Module base address
+   - Current pointer value - Contains the hash from `RESOLVE_TYPE()`
+5. **Replace Hash:** Overwrites each hash value with the resolved function address
+
+### Complete Example
+
+```cpp
+class instance {
+    // Kernel32 API structure
+    struct {
+        uintptr_t handle;  // Index 0 - skipped by RESOLVE_IMPORT
+        
+        struct {
+            D_API(LoadLibraryA)      // Index 1
+            D_API(GetProcAddress)    // Index 2
+            D_API(VirtualAlloc)      // Index 3
+        };
+    } kernel32 = {
+        RESOLVE_TYPE(LoadLibraryA),
+        RESOLVE_TYPE(GetProcAddress),
+        RESOLVE_TYPE(VirtualAlloc)
+    };
+    
+    // Ntdll API structure
+    struct {
+        uintptr_t handle;
+        
+        struct {
+            D_API(DbgPrint)
+            D_API(RtlAllocateHeap)
+        };
+    } ntdll = {
+        RESOLVE_TYPE(DbgPrint),
+        RESOLVE_TYPE(RtlAllocateHeap)
+    };
+    
+public:
+    explicit instance() {
+        // Get module base addresses
+        ntdll.handle = resolve::module(
+            expr::hash_string<wchar_t>(L"ntdll.dll")
+        );
+        
+        kernel32.handle = resolve::module(
+            expr::hash_string<wchar_t>(L"kernel32.dll")
+        );
+        
+        // Batch resolve all APIs
+        RESOLVE_IMPORT(ntdll);      // Resolves DbgPrint, RtlAllocateHeap
+        RESOLVE_IMPORT(kernel32);   // Resolves LoadLibraryA, GetProcAddress, VirtualAlloc
+    }
+};
+
+// After resolution, call APIs directly:
+ntdll.DbgPrint("Debug message\n");
+auto user32 = kernel32.LoadLibraryA("user32.dll");
+```
+
+### Memory Layout
+
+**Before RESOLVE_IMPORT:**
+```
+kernel32:
+  +0x00: handle         = 0x7FFE0000 (module base)
+  +0x08: LoadLibraryA   = 0x12345678 (hash value)
+  +0x10: GetProcAddress = 0x87654321 (hash value)
+  +0x18: VirtualAlloc   = 0xABCDEF00 (hash value)
+```
+
+**After RESOLVE_IMPORT:**
+```
+kernel32:
+  +0x00: handle         = 0x7FFE0000 (unchanged)
+  +0x08: LoadLibraryA   = 0x7FFE1234 (resolved address)
+  +0x10: GetProcAddress = 0x7FFE5678 (resolved address)
+  +0x18: VirtualAlloc   = 0x7FFE9ABC (resolved address)
+```
+
+<Warning>
+  The structure must have `handle` as the first member, and all function pointers must be contiguous in memory. Anonymous nested structures ensure proper alignment.
+</Warning>
+
+---
+
+## declfn
+
+Function attribute that places code into the `.text$B` section for proper position-independent code organization.
+
+```cpp
+#define declfn __attribute__((section(".text$B")))
+```
+
+### Purpose
+
+The `declfn` attribute ensures functions are placed in a specific PE section during linking, which is critical for position-independent shellcode:
+
+- **Section Ordering:** `.text$B` comes after `.text$A` but before `.text$C`
+- **Contiguous Layout:** All shellcode functions are grouped together
+- **PIC Compatibility:** Enables proper calculation of shellcode boundaries
+
+### Usage
+
+```cpp
+// Declare functions with declfn
+auto declfn resolve::module(const uint32_t library_hash) -> uintptr_t {
+    // Implementation
+}
+
+auto declfn resolve::_api(const uintptr_t module_base, const uintptr_t symbol_hash) -> uintptr_t {
+    // Implementation
+}
+
+template <typename T>
+inline auto declfn symbol(T s) -> T {
+    // Implementation
+}
+
+extern "C" auto declfn entry(_In_ void* args) -> void {
+    stardust::instance().start(args);
+}
+```
+
+### Section Organization
+
+```
+[PE File Sections]
+  .text$A  - Startup code (entry points)
+  .text$B  - Main shellcode functions (declfn)
+  .text$C  - Auxiliary functions
+  .data    - Initialized data
+  .rdata   - Read-only data (strings)
+```
+
+<Info>
+  The `$` suffix in section names is a Microsoft extension that allows alphabetic ordering of subsections within a major section.
+</Info>
+
+---
+
+## RangeHeadList()
+
+Macro for iterating over Windows doubly-linked lists (LIST_ENTRY structures).
+
+```cpp
+#define RangeHeadList(HEAD_LIST, TYPE, SCOPE) \
+{                                               \
+    PLIST_ENTRY __Head = (&HEAD_LIST);          \
+    PLIST_ENTRY __Next = {0};                   \
+    TYPE        Entry  = (TYPE)__Head->Flink;   \
+    for (; __Head != (PLIST_ENTRY)Entry;) {     \
+        __Next = ((PLIST_ENTRY)Entry)->Flink;   \
+        SCOPE                                   \
+        Entry = (TYPE)(__Next);                 \
+    }                                           \
+}
+```
+
+<ParamField path="HEAD_LIST" type="LIST_ENTRY">
+  Head node of the doubly-linked list to iterate.
+</ParamField>
+
+<ParamField path="TYPE" type="pointer type">
+  Type to cast each list entry to (e.g., `PLDR_DATA_TABLE_ENTRY`).
+</ParamField>
+
+<ParamField path="SCOPE" type="code block">
+  Code to execute for each entry. Use `Entry` to access the current node.
+</ParamField>
+
+### Windows LIST_ENTRY Structure
+
+```cpp
+typedef struct _LIST_ENTRY {
+    struct _LIST_ENTRY *Flink;  // Forward link
+    struct _LIST_ENTRY *Blink;  // Backward link
+} LIST_ENTRY, *PLIST_ENTRY;
+```
+
+### Example: Iterating Loaded Modules
+
+```cpp
+auto declfn resolve::module(const uint32_t library_hash) -> uintptr_t {
+    // Iterate through loaded modules in PEB
+    RangeHeadList(
+        NtCurrentPeb()->Ldr->InLoadOrderModuleList,
+        PLDR_DATA_TABLE_ENTRY,
+        {
+            // Return first module if hash is 0
+            if (!library_hash) {
+                return reinterpret_cast<uintptr_t>(Entry->DllBase);
+            }
+            
+            // Compare hash of module name
+            if (stardust::hash_string<wchar_t>(Entry->BaseDllName.Buffer) == library_hash) {
+                return reinterpret_cast<uintptr_t>(Entry->DllBase);
+            }
+        }
+    )
+    
+    return 0;  // Not found
+}
+```
+
+### How It Works
+
+1. **Initialize:** Save head node pointer
+2. **Start at First Entry:** `Entry = __Head->Flink`
+3. **Loop Until Back at Head:** Continue while `Entry != __Head`
+4. **Save Next Pointer:** Store `Entry->Flink` before executing scope
+5. **Execute Scope:** Run user code with `Entry` pointing to current node
+6. **Advance:** Move to next entry
+
+### LDR_DATA_TABLE_ENTRY
+
+```cpp
+typedef struct _LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+    // ... more fields
+} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+```
+
+### Common Use Cases
+
+**Enumerate all loaded modules:**
+```cpp
+RangeHeadList(
+    NtCurrentPeb()->Ldr->InLoadOrderModuleList,
+    PLDR_DATA_TABLE_ENTRY,
+    {
+        DBG_PRINTF("Module: %ls at %p\n", 
+            Entry->BaseDllName.Buffer,
+            Entry->DllBase
+        );
+    }
+)
+```
+
+**Find specific module by name:**
+```cpp
+PVOID find_module(const wchar_t* name) {
+    RangeHeadList(
+        NtCurrentPeb()->Ldr->InLoadOrderModuleList,
+        PLDR_DATA_TABLE_ENTRY,
+        {
+            if (wcscmp(Entry->BaseDllName.Buffer, name) == 0) {
+                return Entry->DllBase;
+            }
+        }
+    )
+    return nullptr;
+}
+```
+
+<Tip>
+  The macro saves the next pointer before executing the scope, allowing safe modification or early returns within the loop body.
+</Tip>
+
+---
+
+## Example: Complete API Resolution Pattern
+
+```cpp
+class instance {
+    // Define API structures
+    struct {
+        uintptr_t handle;
+        struct {
+            D_API(LoadLibraryA)
+            D_API(GetProcAddress)
+        };
+    } kernel32 = {
+        RESOLVE_TYPE(LoadLibraryA),
+        RESOLVE_TYPE(GetProcAddress)
+    };
+    
+    struct {
+        uintptr_t handle;
+        struct {
+            D_API(DbgPrint)
+        };
+    } ntdll = {
+        RESOLVE_TYPE(DbgPrint)
+    };
+    
+public:
+    declfn instance() {
+        // Step 1: Resolve module base addresses
+        ntdll.handle = resolve::module(
+            expr::hash_string<wchar_t>(L"ntdll.dll")
+        );
+        
+        kernel32.handle = resolve::module(
+            expr::hash_string<wchar_t>(L"kernel32.dll")
+        );
+        
+        // Step 2: Batch resolve all APIs
+        RESOLVE_IMPORT(ntdll);
+        RESOLVE_IMPORT(kernel32);
+    }
+    
+    auto declfn start(_In_ void* arg) -> void {
+        // Step 3: Use resolved APIs
+        const auto user32 = kernel32.LoadLibraryA(
+            symbol<const char*>("user32.dll")
+        );
+        
+        // Step 4: Resolve additional APIs
+        decltype(MessageBoxA)* msgbox = RESOLVE_API(
+            reinterpret_cast<uintptr_t>(user32),
+            MessageBoxA
+        );
+        
+        msgbox(
+            nullptr,
+            symbol<const char*>("Hello from Stardust!"),
+            symbol<const char*>("Shellcode"),
+            MB_OK
+        );
+    }
+};
+```

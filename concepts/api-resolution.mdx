@@ -1,0 +1,785 @@
+---
+title: "API Resolution"
+description: "Dynamic API resolution through PEB walking and export table parsing"
+---
+
+## Why Dynamic API Resolution?
+
+Shellcode cannot rely on the Import Address Table (IAT) like normal executables because:
+
+1. **No loader**: The Windows PE loader doesn't process shellcode
+2. **No imports section**: Shellcode is raw binary, not a full PE file
+3. **Stealth**: A normal IAT would expose all APIs you intend to use
+
+Dynamic API resolution solves this by:
+- Finding module base addresses at runtime
+- Parsing PE export tables manually
+- Resolving function addresses by name (or hash)
+- Building your own "import table" in memory
+
+## Overview: The Resolution Process
+
+API resolution in Stardust happens in two phases:
+
+### Phase 1: Module Resolution
+
+Find the base address of a DLL (e.g., `kernel32.dll`, `ntdll.dll`):
+
+```cpp
+auto module_base = resolve::module(
+    expr::hash_string<wchar_t>(L"kernel32.dll")
+);
+```
+
+This walks the Process Environment Block (PEB) to find loaded modules.
+
+### Phase 2: Function Resolution
+
+Find a specific function within a module:
+
+```cpp
+auto func_ptr = resolve::api<LOADLIBRARY>(
+    module_base,
+    expr::hash_string("LoadLibraryA")
+);
+```
+
+This parses the PE export table to find the function's address.
+
+## Walking the PEB
+
+The Process Environment Block (PEB) is a Windows kernel structure that contains process information, including a list of loaded modules.
+
+### What is the PEB?
+
+Every Windows process has a PEB accessible through the Thread Environment Block (TEB):
+
+```
+TEB → PEB → Ldr → InLoadOrderModuleList
+                     ↓
+                  [ntdll.dll]
+                     ↓
+                  [kernel32.dll]
+                     ↓
+                  [user32.dll]
+                     ↓
+                    ...
+```
+
+The PEB contains:
+- Process parameters (command line, environment)
+- Heap information
+- **Loader data (Ldr)**: List of loaded modules
+
+### Accessing the PEB
+
+From `include/native.h`, Stardust uses intrinsic accessors:
+
+```cpp
+#define NtCurrentPeb() ((PPEB)__readgsqword(0x60))  // x64
+#define NtCurrentPeb() ((PPEB)__readfsdword(0x30))  // x86
+```
+
+These read from the TEB:
+- **x64**: GS register offset `0x60` points to PEB
+- **x86**: FS register offset `0x30` points to PEB
+
+### Module Resolution Implementation
+
+From `src/resolve.cc:15-31`:
+
+```cpp
+auto declfn resolve::module(
+   _In_ const uint32_t library_hash
+) -> uintptr_t {
+    // Iterate over the linked list
+    RangeHeadList( NtCurrentPeb()->Ldr->InLoadOrderModuleList, PLDR_DATA_TABLE_ENTRY, {
+        if ( !library_hash ) {
+            return reinterpret_cast<uintptr_t>( Entry->DllBase );
+        }
+
+        if ( stardust::hash_string<wchar_t>( Entry->BaseDllName.Buffer ) == library_hash ) {
+            return reinterpret_cast<uintptr_t>( Entry->DllBase ); 
+        }
+    } )
+
+    return 0;
+}
+```
+
+**Key components:**
+
+1. **NtCurrentPeb()**: Get the PEB
+2. **Ldr**: Loader data structure
+3. **InLoadOrderModuleList**: Doubly-linked list of loaded modules
+4. **RangeHeadList**: Macro to iterate the list (defined in `include/macros.h:14-24`)
+
+### LDR_DATA_TABLE_ENTRY Structure
+
+Each module in the list is represented by an `LDR_DATA_TABLE_ENTRY`:
+
+```cpp
+typedef struct _LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;      // Linked list pointers
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;                    // ← Module base address
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING FullDllName;       // Full path
+    UNICODE_STRING BaseDllName;       // ← DLL name (e.g., L"kernel32.dll")
+    // ... more fields
+} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+```
+
+**Important fields:**
+- `DllBase`: Base address where the module is loaded
+- `BaseDllName.Buffer`: Wide string containing the module name
+
+### Walking Algorithm
+
+The `RangeHeadList` macro (`include/macros.h:14-24`) implements list traversal:
+
+```cpp
+#define RangeHeadList( HEAD_LIST, TYPE, SCOPE ) \
+{                                               \
+    PLIST_ENTRY __Head = ( & HEAD_LIST );       \
+    PLIST_ENTRY __Next = { 0 };                 \
+    TYPE        Entry  = (TYPE)__Head->Flink;   \
+    for ( ; __Head != (PLIST_ENTRY)Entry; ) {   \
+        __Next = ((PLIST_ENTRY)Entry)->Flink;   \
+        SCOPE                                   \
+        Entry = (TYPE)(__Next);                 \
+    }                                           \
+}
+```
+
+**Iteration steps:**
+
+1. `__Head` points to the list head
+2. `Entry` starts at the first element (`Flink`)
+3. Loop until we circle back to `__Head`
+4. Execute `SCOPE` (the code block) for each entry
+5. Move to next entry via `Flink`
+
+### Module Resolution Flow
+
+```cpp
+auto ntdll_base = resolve::module(
+    expr::hash_string<wchar_t>(L"ntdll.dll")
+);
+```
+
+**Step-by-step:**
+
+1. Get PEB: `NtCurrentPeb()`
+2. Get loader data: `PEB->Ldr`
+3. Start at list head: `InLoadOrderModuleList`
+4. For each module entry:
+   - Read `BaseDllName.Buffer` (e.g., `L"ntdll.dll"`)
+   - Hash it at runtime: `stardust::hash_string<wchar_t>(L"ntdll.dll")`
+   - Compare with target hash: `expr::hash_string<wchar_t>(L"ntdll.dll")`
+   - If match, return `Entry->DllBase`
+5. If no match found, return `0`
+
+**Example output:**
+
+```
+ntdll_base = 0x00007FF8A2D10000  (runtime address of ntdll.dll)
+```
+
+### Special Case: First Module
+
+```cpp
+if ( !library_hash ) {
+    return reinterpret_cast<uintptr_t>( Entry->DllBase );
+}
+```
+
+Passing a hash of `0` returns the first module in the list, which is always the current executable (or in shellcode's case, the host process).
+
+## Parsing PE Export Tables
+
+Once you have a module base address, you need to find specific functions by parsing the PE export table.
+
+### PE Structure Overview
+
+A PE (Portable Executable) file has this structure:
+
+```
+┌─────────────────────┐
+│   DOS Header        │ ← module_base + 0
+│   e_magic = 'MZ'    │
+│   e_lfanew → NT Hdr │
+└─────────────────────┘
+         ↓
+┌─────────────────────┐
+│   NT Headers        │ ← module_base + e_lfanew
+│   Signature = 'PE'  │
+│   File Header       │
+│   Optional Header   │
+│     └→ DataDirectory│
+│          [0] Export │ ← Export table location
+└─────────────────────┘
+         ↓
+┌─────────────────────┐
+│   Export Directory  │
+│   - AddressOfNames  │ → Array of RVAs to function name strings
+│   - AddressOfFuncs  │ → Array of RVAs to function addresses
+│   - AddressOfOrdinals│→ Array of ordinals
+└─────────────────────┘
+```
+
+### Function Resolution Implementation
+
+From `src/resolve.cc:47-88`:
+
+```cpp
+auto declfn resolve::_api(
+    _In_ const uintptr_t module_base,
+    _In_ const uintptr_t symbol_hash
+) -> uintptr_t {
+    auto address      = uintptr_t { 0 };
+    auto nt_header    = PIMAGE_NT_HEADERS { nullptr };
+    auto dos_header   = PIMAGE_DOS_HEADER { nullptr };
+    auto export_dir   = PIMAGE_EXPORT_DIRECTORY { nullptr };
+    auto export_names = PDWORD { nullptr };
+    auto export_addrs = PDWORD { nullptr };
+    auto export_ordns = PWORD { nullptr };
+    auto symbol_name  = PSTR { nullptr };
+
+    // Parse DOS header
+    dos_header = reinterpret_cast<PIMAGE_DOS_HEADER>( module_base );
+    if ( dos_header->e_magic != IMAGE_DOS_SIGNATURE ) {
+        return 0;
+    }
+
+    // Parse NT headers
+    nt_header = reinterpret_cast<PIMAGE_NT_HEADERS>( module_base + dos_header->e_lfanew );
+    if ( nt_header->Signature != IMAGE_NT_SIGNATURE ) {
+        return 0;
+    }
+
+    // Get export directory
+    export_dir   = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>( 
+        module_base + nt_header->OptionalHeader.DataDirectory[ IMAGE_DIRECTORY_ENTRY_EXPORT ].VirtualAddress );
+    export_names = reinterpret_cast<PDWORD>( module_base + export_dir->AddressOfNames );
+    export_addrs = reinterpret_cast<PDWORD>( module_base + export_dir->AddressOfFunctions );
+    export_ordns = reinterpret_cast<PWORD> ( module_base + export_dir->AddressOfNameOrdinals );
+
+    // Search for matching function
+    for ( int i = 0; i < export_dir->NumberOfNames; i++ ) {
+        symbol_name = reinterpret_cast<PSTR>( module_base + export_names[ i ] );
+
+        if ( stardust::hash_string( symbol_name ) != symbol_hash ) {
+            continue;
+        }
+
+        address = module_base + export_addrs[ export_ordns[ i ] ];
+
+        break;
+    }
+
+    return address;
+}
+```
+
+### Step 1: Validate DOS Header
+
+```cpp
+dos_header = reinterpret_cast<PIMAGE_DOS_HEADER>( module_base );
+if ( dos_header->e_magic != IMAGE_DOS_SIGNATURE ) {  // 'MZ' = 0x5A4D
+    return 0;
+}
+```
+
+Every PE file starts with a DOS header. The magic bytes `'MZ'` (0x5A4D) identify it as a valid executable.
+
+**DOS Header fields:**
+- `e_magic`: Magic number ('MZ')
+- `e_lfanew`: Offset to NT headers
+
+### Step 2: Validate NT Headers
+
+```cpp
+nt_header = reinterpret_cast<PIMAGE_NT_HEADERS>( 
+    module_base + dos_header->e_lfanew 
+);
+if ( nt_header->Signature != IMAGE_NT_SIGNATURE ) {  // 'PE\0\0' = 0x00004550
+    return 0;
+}
+```
+
+The NT headers start with the signature `'PE\0\0'` (0x00004550).
+
+**NT Headers contain:**
+- Signature: `'PE\0\0'`
+- File Header: Architecture, number of sections, etc.
+- Optional Header: Entry point, image base, **data directories**
+
+### Step 3: Locate Export Directory
+
+```cpp
+export_dir = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>( 
+    module_base + 
+    nt_header->OptionalHeader.DataDirectory[ IMAGE_DIRECTORY_ENTRY_EXPORT ].VirtualAddress 
+);
+```
+
+The Optional Header contains a `DataDirectory` array. Index `[0]` (`IMAGE_DIRECTORY_ENTRY_EXPORT`) points to the export directory.
+
+**Export Directory structure:**
+
+```cpp
+typedef struct _IMAGE_EXPORT_DIRECTORY {
+    DWORD   Characteristics;
+    DWORD   TimeDateStamp;
+    WORD    MajorVersion;
+    WORD    MinorVersion;
+    DWORD   Name;                    // RVA to module name
+    DWORD   Base;                    // Ordinal base
+    DWORD   NumberOfFunctions;       // Total number of exports
+    DWORD   NumberOfNames;           // Number of named exports
+    DWORD   AddressOfFunctions;      // RVA to function address array
+    DWORD   AddressOfNames;          // RVA to function name array
+    DWORD   AddressOfNameOrdinals;   // RVA to ordinal array
+} IMAGE_EXPORT_DIRECTORY;
+```
+
+### Step 4: Get Export Arrays
+
+```cpp
+export_names = reinterpret_cast<PDWORD>( module_base + export_dir->AddressOfNames );
+export_addrs = reinterpret_cast<PDWORD>( module_base + export_dir->AddressOfFunctions );
+export_ordns = reinterpret_cast<PWORD> ( module_base + export_dir->AddressOfNameOrdinals );
+```
+
+The export directory contains three parallel arrays:
+
+1. **AddressOfNames**: RVAs to function name strings
+2. **AddressOfFunctions**: RVAs to function code
+3. **AddressOfNameOrdinals**: Ordinals that index into AddressOfFunctions
+
+**Array relationship:**
+
+```
+Index    Names              Ordinals    Functions
+─────────────────────────────────────────────────
+  0      "LoadLibraryA"  →    42     →  0x1A3C0
+  1      "GetProcAddress" →   17     →  0x1B540
+  2      "VirtualAlloc"   →   89     →  0x1C2A0
+  ...
+```
+
+To resolve "LoadLibraryA":
+1. Find "LoadLibraryA" in `AddressOfNames[0]`
+2. Get ordinal from `AddressOfNameOrdinals[0]` → `42`
+3. Get function RVA from `AddressOfFunctions[42]` → `0x1A3C0`
+4. Add module base: `module_base + 0x1A3C0` = function address
+
+### Step 5: Search for Function
+
+```cpp
+for ( int i = 0; i < export_dir->NumberOfNames; i++ ) {
+    symbol_name = reinterpret_cast<PSTR>( module_base + export_names[ i ] );
+
+    if ( stardust::hash_string( symbol_name ) != symbol_hash ) {
+        continue;
+    }
+
+    address = module_base + export_addrs[ export_ordns[ i ] ];
+
+    break;
+}
+```
+
+**Loop breakdown:**
+
+1. Iterate through all named exports
+2. Get the name string: `module_base + export_names[i]`
+3. Hash the name at runtime: `stardust::hash_string(symbol_name)`
+4. Compare with target hash (from compile time)
+5. If match found:
+   - Get ordinal: `export_ordns[i]`
+   - Get function RVA: `export_addrs[ordinal]`
+   - Calculate absolute address: `module_base + RVA`
+6. Return the address
+
+### Complete Resolution Example
+
+Resolving `LoadLibraryA` from kernel32.dll:
+
+```cpp
+// Phase 1: Find kernel32.dll
+auto kernel32_base = resolve::module(
+    expr::hash_string<wchar_t>(L"kernel32.dll")  // Hash = 0x6A4ABC5B
+);
+// Returns: 0x00007FF8A1E20000
+
+// Phase 2: Find LoadLibraryA
+auto loadlibrary_ptr = resolve::api<decltype(LoadLibraryA)>(
+    kernel32_base,
+    expr::hash_string("LoadLibraryA")  // Hash = 0xE0147A9C
+);
+// Returns: 0x00007FF8A1E3A3C0
+
+// Now you can call it
+loadlibrary_ptr("user32.dll");
+```
+
+## RESOLVE_IMPORT Macro Mechanics
+
+The `RESOLVE_IMPORT` macro automates resolving multiple APIs at once.
+
+### Macro Definition
+
+From `include/macros.h:8-12`:
+
+```cpp
+#define RESOLVE_IMPORT( m ) { \
+    for ( int i = 1; i < expr::struct_count<decltype( instance::m )>(); i++ ) { \
+        reinterpret_cast<uintptr_t*>( &m )[ i ] = \
+            resolve::_api( m.handle, reinterpret_cast<uintptr_t*>( &m )[ i ] ); \
+    } \
+}
+```
+
+### How It Works
+
+#### Structure Layout
+
+Consider the kernel32 structure:
+
+```cpp
+struct {
+    uintptr_t handle;  // Offset 0: module base address
+    struct {
+        decltype(LoadLibraryA)*    LoadLibraryA;     // Offset 8
+        decltype(GetProcAddress)*  GetProcAddress;   // Offset 16
+    };
+} kernel32 = {
+    RESOLVE_TYPE( LoadLibraryA ),     // Initializes to hash
+    RESOLVE_TYPE( GetProcAddress )    // Initializes to hash
+};
+```
+
+Where `RESOLVE_TYPE` (`include/resolve.h:8`) is:
+
+```cpp
+#define RESOLVE_TYPE( s )   .s = reinterpret_cast<decltype(s)*>( expr::hash_string( # s ) )
+```
+
+**Initial memory layout:**
+
+```
+Offset   Field               Value
+──────────────────────────────────────
+  0      handle              0x00007FF8A1E20000  (module base)
+  8      LoadLibraryA        0xE0147A9C          (hash)
+  16     GetProcAddress      0x7C0DFCAA          (hash)
+```
+
+#### Iteration Process
+
+```cpp
+for ( int i = 1; i < expr::struct_count<decltype( instance::m )>(); i++ )
+```
+
+The loop starts at `i = 1` to skip the `handle` field (offset 0) and iterate only over the API pointers.
+
+**struct_count** (`include/constexpr.h:8-18`) calculates the number of pointer-sized fields:
+
+```cpp
+template <typename T>
+constexpr size_t struct_count() {
+    size_t memberCount  = 0;
+    size_t sizeOfStruct = sizeof( T );
+
+    while ( sizeOfStruct > memberCount * sizeof( uintptr_t ) ) {
+        memberCount++;
+    }
+
+    return memberCount;
+}
+```
+
+For kernel32:
+- Size = 24 bytes (3 * 8 bytes on x64)
+- Count = 3 fields
+
+#### Array-Based Access
+
+```cpp
+reinterpret_cast<uintptr_t*>( &m )[ i ]
+```
+
+This treats the structure as an array of `uintptr_t` values:
+
+```cpp
+&m       = 0x... (address of kernel32 structure)
+&m[0]    = handle
+&m[1]    = LoadLibraryA (currently hash)
+&m[2]    = GetProcAddress (currently hash)
+```
+
+#### Resolution and Replacement
+
+```cpp
+reinterpret_cast<uintptr_t*>( &m )[ i ] = 
+    resolve::_api( m.handle, reinterpret_cast<uintptr_t*>( &m )[ i ] );
+```
+
+**For each field:**
+
+1. Read current value (the hash): `&m[i]`
+2. Call `resolve::_api(module_base, hash)`
+3. Get function address
+4. Write address back to `&m[i]`
+
+**After RESOLVE_IMPORT:**
+
+```
+Offset   Field               Value
+──────────────────────────────────────
+  0      handle              0x00007FF8A1E20000  (unchanged)
+  8      LoadLibraryA        0x00007FF8A1E3A3C0  (function address)
+  16     GetProcAddress      0x00007FF8A1E3B540  (function address)
+```
+
+Now the function pointers are ready to use!
+
+### Usage Example
+
+From `src/main.cc:38-39`:
+
+```cpp
+RESOLVE_IMPORT( ntdll );
+RESOLVE_IMPORT( kernel32 );
+```
+
+This resolves all APIs in both modules with just two lines.
+
+## Complete Resolution Workflow
+
+Putting it all together, here's the complete flow from shellcode entry to API usage:
+
+### 1. Shellcode Entry
+
+```nasm
+stardust:
+    ; Setup stack
+    call  entry
+    ret
+```
+
+### 2. Create Instance
+
+```cpp
+extern "C" auto declfn entry(_In_ void* args) -> void {
+    stardust::instance().start( args );
+}
+```
+
+### 3. Instance Constructor
+
+```cpp
+declfn instance::instance(void) {
+    // Calculate shellcode bounds
+    base.address = RipStart();
+    base.length  = ( RipData() - base.address ) + END_OFFSET;
+
+    // Walk PEB to find modules
+    ntdll.handle = resolve::module(
+        expr::hash_string<wchar_t>( L"ntdll.dll" )
+    );
+
+    kernel32.handle = resolve::module(
+        expr::hash_string<wchar_t>( L"kernel32.dll" )
+    );
+
+    // Parse export tables and resolve APIs
+    RESOLVE_IMPORT( ntdll );
+    RESOLVE_IMPORT( kernel32 );
+}
+```
+
+### 4. Use APIs
+
+```cpp
+auto declfn instance::start(_In_ void* arg) -> void {
+    // Load additional module
+    const auto user32 = kernel32.LoadLibraryA( 
+        symbol<const char*>( "user32.dll" ) 
+    );
+
+    // Resolve function from new module
+    decltype( MessageBoxA ) * msgbox = RESOLVE_API( 
+        reinterpret_cast<uintptr_t>( user32 ), 
+        MessageBoxA 
+    );
+
+    // Call the function
+    msgbox( nullptr, 
+        symbol<const char*>( "Hello world" ), 
+        symbol<const char*>( "caption" ), 
+        MB_OK );
+}
+```
+
+## Advanced Techniques
+
+### Forwarded Exports
+
+Some exports are "forwarded" to other DLLs. For example, `kernel32!HeapAlloc` forwards to `ntdll!RtlAllocateHeap`.
+
+**Detection:**
+
+```cpp
+auto rva = export_addrs[ export_ordns[ i ] ];
+auto address = module_base + rva;
+
+// Check if RVA falls within export directory
+auto export_start = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+auto export_size = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+
+if (rva >= export_start && rva < export_start + export_size) {
+    // This is a forwarder string (e.g., "ntdll.RtlAllocateHeap")
+    auto forwarder = reinterpret_cast<char*>(address);
+    // Parse and resolve from target module
+}
+```
+
+Stardust doesn't currently handle forwarded exports, but you can add this logic if needed.
+
+### Ordinal-Only Exports
+
+Some functions are exported by ordinal only (no name). To resolve these:
+
+```cpp
+auto resolve_by_ordinal(uintptr_t module_base, WORD ordinal) -> uintptr_t {
+    // Parse PE headers...
+    
+    if (ordinal < export_dir->Base || 
+        ordinal >= export_dir->Base + export_dir->NumberOfFunctions) {
+        return 0;
+    }
+    
+    auto index = ordinal - export_dir->Base;
+    return module_base + export_addrs[index];
+}
+```
+
+### Caching Resolutions
+
+Resolving APIs is expensive. Cache frequently-used functions:
+
+```cpp
+struct api_cache {
+    uintptr_t LoadLibraryA;
+    uintptr_t GetProcAddress;
+    uintptr_t VirtualAlloc;
+    // etc.
+};
+
+api_cache cache;
+
+// Resolve once
+cache.LoadLibraryA = resolve::api(kernel32, hash("LoadLibraryA"));
+
+// Use many times
+cache.LoadLibraryA("user32.dll");
+```
+
+The `instance` class implements this pattern.
+
+## Security Considerations
+
+### Detection Vectors
+
+**PEB Walking:**
+- EDR products monitor access to `GS:[0x60]` or `FS:[0x30]`
+- Mitigation: Use syscalls or alternative methods
+
+**Export Parsing:**
+- Reading export tables is suspicious
+- Mitigation: Obfuscate the parsing logic
+
+**Hash Comparisons:**
+- Comparing hashes in a loop is a pattern
+- Mitigation: Add junk code, use different algorithms
+
+### Evasion Techniques
+
+**Indirect PEB Access:**
+
+```cpp
+// Instead of direct read
+auto peb = NtCurrentPeb();
+
+// Use a syscall or indirect read
+auto peb = get_peb_via_syscall();
+```
+
+**Randomized Search:**
+
+```cpp
+// Don't search linearly
+for ( int i = rand() % count; i < export_dir->NumberOfNames; i++ ) {
+    // ...
+}
+```
+
+**Timing Delays:**
+
+```cpp
+// Slow down to avoid detection
+Sleep(rand() % 100);
+auto api = resolve::_api(...);
+```
+
+## Troubleshooting
+
+### Module Not Found
+
+**Symptom:** `resolve::module()` returns `0`
+
+**Causes:**
+1. Module not loaded: Use `LoadLibraryA` first
+2. Wrong hash: Verify hash matches module name
+3. Case mismatch: Hash function converts to uppercase
+4. Typo in name: Double-check spelling
+
+**Debug:**
+
+```cpp
+// Dump all loaded modules
+RangeHeadList( NtCurrentPeb()->Ldr->InLoadOrderModuleList, PLDR_DATA_TABLE_ENTRY, {
+    DbgPrint("%ls @ %p\n", Entry->BaseDllName.Buffer, Entry->DllBase);
+})
+```
+
+### Function Not Found
+
+**Symptom:** `resolve::_api()` returns `0`
+
+**Causes:**
+1. Wrong hash: Verify hash matches function name
+2. Function not exported: Check with `dumpbin /exports`
+3. Forwarded export: Not handled by default implementation
+4. Ordinal-only export: No name to hash
+
+**Debug:**
+
+```cpp
+// Dump all exports
+for (int i = 0; i < export_dir->NumberOfNames; i++) {
+    auto name = reinterpret_cast<PSTR>(module_base + export_names[i]);
+    DbgPrint("%s\n", name);
+}
+```
+
+### Hash Collision
+
+**Symptom:** Wrong function resolved
+
+**Solution:** Verify the resolved address or use a different hash algorithm for colliding strings.

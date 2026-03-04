@@ -1,0 +1,330 @@
+---
+title: "Architecture Overview"
+description: "Detailed architecture of the Stardust shellcode framework"
+---
+
+## Component Structure
+
+Stardust is built around a central `instance` class that serves as the main execution context for the shellcode. This class encapsulates all module handles and API function pointers needed during execution.
+
+### Instance Class
+
+The `instance` class (defined in `include/common.h:40-79`) contains:
+
+```cpp
+class instance {
+    struct {
+        uintptr_t address;
+        uintptr_t length;
+    } base = {};
+
+    struct {
+        uintptr_t handle;  // Base address of kernel32.dll
+
+        struct {
+            D_API( LoadLibraryA )
+            D_API( GetProcAddress )
+        };
+    } kernel32 = {
+        RESOLVE_TYPE( LoadLibraryA ),
+        RESOLVE_TYPE( GetProcAddress )
+    };
+
+    struct {
+        uintptr_t handle;  // Base address of ntdll.dll
+
+        struct {
+#ifdef DEBUG
+            D_API( DbgPrint )
+#endif
+        };
+    } ntdll = {
+#ifdef DEBUG
+        RESOLVE_TYPE( DbgPrint )
+#endif
+    };
+
+public:
+    explicit instance();
+    auto start(_In_ void* arg) -> void;
+};
+```
+
+**Key components:**
+- `base`: Stores the shellcode's runtime address and total size
+- `kernel32`: Module handle and function pointers for kernel32.dll APIs
+- `ntdll`: Module handle and function pointers for ntdll.dll APIs
+- Each module structure contains a `handle` (base address) followed by nested structs for API pointers
+
+### D_API Macro
+
+The `D_API` macro (from `include/macros.h:4`) simplifies API pointer declarations:
+
+```cpp
+#define D_API( x )  decltype( x ) * x;
+```
+
+This creates a pointer to the function with the correct type signature. For example, `D_API(LoadLibraryA)` expands to:
+
+```cpp
+decltype(LoadLibraryA) * LoadLibraryA;
+```
+
+## Entry Point Flow
+
+The execution flow follows a carefully orchestrated chain from assembly to C++:
+
+### 1. Assembly Entry Point (.text$A)
+
+For x64 (`src/asm/entry.x64.asm:10-18`):
+
+```nasm
+[SECTION .text$A]
+    stardust:
+        push  rsi
+        mov   rsi, rsp
+        and   rsp, 0FFFFFFFFFFFFFFF0h  ; Align stack to 16 bytes
+        sub   rsp, 020h                 ; Allocate shadow space
+        call  entry
+        mov   rsp, rsi
+        pop   rsi
+    ret
+```
+
+For x86 (`src/asm/entry.x86.asm:10-16`):
+
+```nasm
+[SECTION .text$A]
+    _stardust:
+        push ebp
+        mov  ebp, esp
+        call _entry
+        mov  esp, ebp
+        pop  ebp
+    ret
+```
+
+**Key tasks:**
+- Preserve the calling convention
+- Align the stack (x64 requires 16-byte alignment for Windows ABI)
+- Allocate shadow space on x64 (required by Windows x64 calling convention)
+- Call the C++ `entry` function
+
+### 2. C++ Entry Function
+
+The `entry` function (`src/main.cc:7-12`) creates and starts the instance:
+
+```cpp
+extern "C" auto declfn entry(
+    _In_ void* args
+) -> void {
+    stardust::instance()
+        .start( args );
+}
+```
+
+This uses constructor-initializer pattern - creates a temporary `instance` object and immediately calls its `start()` method.
+
+### 3. Instance Constructor
+
+The constructor (`src/main.cc:14-40`) initializes the shellcode:
+
+```cpp
+declfn instance::instance(void) {
+    // Calculate shellcode base and size
+    base.address = RipStart();
+    base.length  = ( RipData() - base.address ) + END_OFFSET;
+
+    // Resolve module base addresses from PEB
+    if ( ! (( ntdll.handle = resolve::module( 
+        expr::hash_string<wchar_t>( L"ntdll.dll" ) ) )) ) {
+        return;
+    }
+
+    if ( ! (( kernel32.handle = resolve::module( 
+        expr::hash_string<wchar_t>( L"kernel32.dll" ) ) )) ) {
+        return;
+    }
+
+    // Resolve all API function pointers
+    RESOLVE_IMPORT( ntdll );
+    RESOLVE_IMPORT( kernel32 );
+}
+```
+
+**Initialization steps:**
+1. Calculate shellcode boundaries using `RipStart()` and `RipData()`
+2. Find module base addresses by walking the PEB
+3. Resolve all API function pointers from the export tables
+
+### 4. Start Method
+
+The `start()` method (`src/main.cc:42-62`) contains the actual shellcode payload:
+
+```cpp
+auto declfn instance::start(_In_ void* arg) -> void {
+    const auto user32 = kernel32.LoadLibraryA( 
+        symbol<const char*>( "user32.dll" ) );
+
+    DBG_PRINTF( "shellcode @ %p [%d bytes]\n", 
+        base.address, base.length );
+
+    decltype( MessageBoxA ) * msgbox = RESOLVE_API( 
+        reinterpret_cast<uintptr_t>( user32 ), MessageBoxA );
+
+    msgbox( nullptr, 
+        symbol<const char*>( "Hello world" ), 
+        symbol<const char*>( "caption" ), 
+        MB_OK );
+}
+```
+
+## Section Organization
+
+Stardust uses custom linker sections to control memory layout. The linker script (`scripts/linker.ld:1-11`) defines the order:
+
+```ld
+SECTIONS
+{
+    .text :
+    {
+        *( .text$A );  // Entry point code
+        *( .text$B );  // Main code (declfn)
+        *( .rdata* );  // Read-only data (strings)
+        *( .text$C );  // RipData utility
+    }
+}
+```
+
+### Section Layout
+
+```
+┌─────────────────┐ ← RipStart() returns this
+│   .text$A       │   Assembly entry point
+│   stardust()    │
+│   RipStart()    │
+├─────────────────┤
+│   .text$B       │   All C++ code marked with declfn
+│   entry()       │
+│   instance()    │
+│   start()       │
+│   resolve APIs  │
+├─────────────────┤
+│   .rdata        │   String literals and constants
+│   "user32.dll"  │
+│   "Hello world" │
+├─────────────────┤
+│   .text$C       │   RipData utility function
+│   RipData()     │
+└─────────────────┘ ← RipData() returns this + END_OFFSET
+```
+
+### declfn Attribute
+
+The `declfn` macro (`include/macros.h:6`) ensures functions are placed in `.text$B`:
+
+```cpp
+#define declfn __attribute__( (section( ".text$B" )) )
+```
+
+All functions marked with `declfn` are grouped together, making the shellcode layout predictable and enabling accurate size calculation.
+
+## Memory Layout and RIP-Relative Addressing
+
+### Why RIP-Relative?
+
+Shellcode runs at unknown memory addresses. Traditional absolute addressing breaks when code is relocated. RIP-relative addressing solves this by computing addresses relative to the instruction pointer.
+
+### RipStart Function
+
+Returns the base address of the shellcode (`src/asm/entry.x64.asm:20-27`):
+
+```nasm
+RipStart:
+    call RipPtr
+ret
+
+RipPtr:
+    mov rax, [rsp]
+    sub rax, 0x1b
+ret
+```
+
+**How it works:**
+1. `call RipPtr` pushes the return address onto the stack
+2. `mov rax, [rsp]` reads that return address
+3. `sub rax, 0x1b` subtracts the offset to get the start of `stardust`
+4. Returns the shellcode base address
+
+### RipData Function
+
+Returns the address of the data section (`src/asm/utils.x64.asm:7-15`):
+
+```nasm
+[SECTION .text$C]
+    RipData:
+        call RetPtrData
+    ret
+
+    RetPtrData:
+        mov rax, [rsp]
+        sub rax, 0x5
+    ret
+```
+
+Similar technique, but placed in `.text$C` so it returns the address right before the data section begins.
+
+### Size Calculation
+
+The shellcode size is computed as:
+
+```cpp
+base.length = ( RipData() - base.address ) + END_OFFSET;
+```
+
+Where `END_OFFSET` accounts for the small `.text$C` section size.
+
+## Adding New APIs
+
+To add a new API to your shellcode instance:
+
+### 1. Update the Instance Class
+
+In `include/common.h`, add the API to the appropriate module structure:
+
+```cpp
+struct {
+    uintptr_t handle;
+
+    struct {
+        D_API( LoadLibraryA )
+        D_API( GetProcAddress )
+        D_API( VirtualAlloc )  // New API
+    };
+} kernel32 = {
+    RESOLVE_TYPE( LoadLibraryA ),
+    RESOLVE_TYPE( GetProcAddress ),
+    RESOLVE_TYPE( VirtualAlloc )   // New API
+};
+```
+
+### 2. The Constructor Auto-Resolves
+
+The `RESOLVE_IMPORT` macro (`include/macros.h:8-12`) automatically resolves all APIs:
+
+```cpp
+#define RESOLVE_IMPORT( m ) { \
+    for ( int i = 1; i < expr::struct_count<decltype( instance::m )>(); i++ ) { \
+        reinterpret_cast<uintptr_t*>( &m )[ i ] = \
+            resolve::_api( m.handle, reinterpret_cast<uintptr_t*>( &m )[ i ] ); \
+    } \
+}
+```
+
+This macro:
+1. Iterates through each field in the module structure
+2. Treats the stored hash as a lookup key
+3. Resolves the actual function address
+4. Replaces the hash with the function pointer
+
+No additional code needed in the constructor - the macro handles everything!

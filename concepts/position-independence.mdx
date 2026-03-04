@@ -1,0 +1,410 @@
+---
+title: "Position Independence"
+description: "How Stardust achieves position-independent code execution"
+---
+
+## What is Position-Independent Code?
+
+Position-independent code (PIC) is code that executes correctly regardless of where it's loaded in memory. This is critical for shellcode because:
+
+1. **No fixed addresses**: You don't know where your code will be loaded
+2. **No relocations**: Traditional PE files have relocation tables - shellcode doesn't
+3. **Data access**: You need to access strings and constants without hardcoded addresses
+4. **Self-awareness**: The code must discover its own location at runtime
+
+### Why PIC Matters for Shellcode
+
+When injected into a process, shellcode can land anywhere in memory. Consider this scenario:
+
+```cpp
+// ❌ This breaks - hardcoded address
+const char* message = (const char*)0x140001000;
+
+// ✅ This works - calculated at runtime
+const char* message = symbol<const char*>("Hello");
+```
+
+The first example assumes the string is at a specific address. If your shellcode loads at `0x180000000` instead of `0x140000000`, it will read garbage or crash.
+
+## RipStart() - Finding Your Base
+
+The `RipStart()` function calculates the shellcode's base address using a clever call-stack trick.
+
+### x64 Implementation
+
+From `src/asm/entry.x64.asm:20-27`:
+
+```nasm
+RipStart:
+    call RipPtr        ; Push return address to stack
+ret
+
+RipPtr:
+    mov rax, [rsp]     ; Read return address
+    sub rax, 0x1b      ; Subtract offset to shellcode start
+ret
+```
+
+**How it works:**
+
+1. `call RipPtr` pushes the return address (the `ret` after `call`) onto the stack
+2. `[rsp]` contains the address of the instruction immediately after `call`
+3. Subtract the known offset from start of shellcode to this instruction
+4. Result: absolute base address of the shellcode
+
+### x86 Implementation
+
+From `src/asm/entry.x86.asm:18-25`:
+
+```nasm
+_RipStart:
+    call _RipPtr
+ret
+
+_RipPtr:
+    mov eax, [esp]
+    sub eax, 0x11      ; Different offset for 32-bit
+ret
+```
+
+Same technique, different register names and offset values.
+
+### Usage in Code
+
+The base address is calculated in the instance constructor (`src/main.cc:19`):
+
+```cpp
+base.address = RipStart();
+```
+
+Now `base.address` contains the absolute memory address where your shellcode is loaded, regardless of where that is.
+
+## RipData() - Locating Your Data Section
+
+The `RipData()` function returns the address where the data section (strings, constants) begins.
+
+### Implementation
+
+From `src/asm/utils.x64.asm:7-15`:
+
+```nasm
+[SECTION .text$C]
+    RipData:
+        call RetPtrData
+    ret
+
+    RetPtrData:
+        mov rax, [rsp]
+        sub rax, 0x5
+    ret
+```
+
+**Why a separate section?**
+
+By placing `RipData()` in `.text$C`, which is positioned after all code (`.text$A` and `.text$B`) and right before `.rdata`, it provides a reliable marker for where the data section starts.
+
+### Section Layout
+
+The linker script (`scripts/linker.ld`) enforces this order:
+
+```ld
+SECTIONS
+{
+    .text :
+    {
+        *( .text$A );   // Entry point
+        *( .text$B );   // Main code
+        *( .rdata* );   // Data section ← We need to find this
+        *( .text$C );   // RipData marker
+    }
+}
+```
+
+### Size Calculation
+
+Using both functions together (`src/main.cc:19-20`):
+
+```cpp
+base.address = RipStart();  // Start of shellcode
+base.length  = ( RipData() - base.address ) + END_OFFSET;
+```
+
+This calculates the total shellcode size by measuring from start to end.
+
+## symbol() - Accessing Raw Strings
+
+The `symbol<T>()` template function provides position-independent access to string literals and data.
+
+### Implementation
+
+From `include/common.h:35-38`:
+
+```cpp
+template <typename T>
+inline T symbol(T s) {
+    return reinterpret_cast<T>(RipData()) - 
+           (reinterpret_cast<uintptr_t>(&RipData) - 
+            reinterpret_cast<uintptr_t>(s));
+}
+```
+
+### How It Works
+
+This function calculates the runtime address of a compile-time constant using pointer arithmetic:
+
+```
+Runtime Address = RipData() - (&RipData - compile_time_address)
+
+Simplified:
+Runtime Address = RipData() - &RipData + compile_time_address
+```
+
+**Step by step:**
+
+1. `RipData()` returns the runtime address of the data section
+2. `&RipData` is the compile-time address where the compiler placed `RipData` function
+3. `s` is the compile-time address of the string literal
+4. The difference `(&RipData - s)` is a compile-time constant offset
+5. Subtracting this offset from the runtime `RipData()` gives the runtime address of `s`
+
+### Usage Examples
+
+Loading a DLL:
+
+```cpp
+const auto user32 = kernel32.LoadLibraryA( 
+    symbol<const char*>( "user32.dll" ) 
+);
+```
+
+At compile time:
+- `"user32.dll"` is stored in `.rdata` at offset, say, `0x1000`
+- Compiler uses this temporary address
+
+At runtime:
+- `symbol()` calculates: "Where is the data section now?" + "offset to this string"
+- Returns the correct runtime address
+- LoadLibraryA receives valid pointer to "user32.dll"
+
+### Type Safety
+
+The template parameter enforces type safety:
+
+```cpp
+// ✅ Correct - returns const char*
+symbol<const char*>("string")
+
+// ✅ Correct - returns const wchar_t*
+symbol<const wchar_t*>(L"wide string")
+
+// ❌ Type mismatch would cause compile error
+```
+
+## Linker Script and Section Ordering
+
+The linker script is the foundation of position independence in Stardust.
+
+### Complete Script
+
+From `scripts/linker.ld`:
+
+```ld
+SECTIONS
+{
+    .text :
+    {
+        *( .text$A );   // Entry and RipStart
+        *( .text$B );   // All main code
+        *( .rdata* );   // String constants
+        *( .text$C );   // RipData
+    }
+}
+```
+
+### Why This Order Matters
+
+**1. .text$A First**
+
+Contains the entry point. Must be at the beginning so when the shellcode is called, execution starts here.
+
+**2. .text$B Second**
+
+All functions marked with `declfn` go here:
+
+```cpp
+#define declfn __attribute__( (section( ".text$B" )) )
+```
+
+From `include/macros.h:6`. This groups all your main code together.
+
+**3. .rdata Third**
+
+String literals and constants. By placing this after all code, we can:
+- Use `RipData()` to find it
+- Calculate shellcode size (code ends where data begins)
+- Access strings with `symbol<T>()`
+
+**4. .text$C Last**
+
+The `RipData()` function itself. Acts as a marker for the end of the shellcode.
+
+### Memory Layout Example
+
+If shellcode loads at `0x180000000`:
+
+```
+Address           Section    Content
+──────────────────────────────────────────
+0x180000000       .text$A    stardust:
+0x180000020       .text$A    RipStart:
+0x180000030       .text$B    entry:
+0x180000050       .text$B    instance::instance():
+0x180000120       .text$B    instance::start():
+0x180000200       .text$B    resolve::module():
+0x180000350       .text$B    resolve::_api():
+0x180000500       .rdata     "ntdll.dll\0"
+0x18000050C       .rdata     "kernel32.dll\0"
+0x18000051A       .rdata     "user32.dll\0"
+0x180000526       .rdata     "Hello world\0"
+0x180000532       .rdata     "caption\0"
+0x18000053B       .text$C    RipData:
+0x180000550       (end)
+```
+
+Now when you call:
+
+```cpp
+symbol<const char*>("Hello world")
+```
+
+The function calculates `0x180000526` at runtime, even though the compiler used a different address.
+
+## Practical Example: Position-Independent String Access
+
+Let's trace a complete example of accessing a string:
+
+### Compile Time
+
+Source code:
+
+```cpp
+kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+```
+
+Compiler generates:
+1. Stores `"user32.dll\0"` in `.rdata` section
+2. Assigns temporary address, e.g., `0x00001000`
+3. Generates call to `symbol()` with `0x00001000` as argument
+
+### Link Time
+
+Linker:
+1. Places `.text$A` at offset `0x0000`
+2. Places `.text$B` at offset `0x0200`
+3. Places `.rdata` at offset `0x0500` ("user32.dll" at `0x051A`)
+4. Places `.text$C` at offset `0x053B`
+
+### Runtime (Shellcode at 0x180000000)
+
+Execution:
+
+1. **RipStart() called**
+   - Returns `0x180000000`
+
+2. **RipData() called within symbol()**
+   - Returns `0x18000053B` (runtime address of `.text$C`)
+
+3. **Pointer arithmetic in symbol()**
+   ```cpp
+   compile_time_rdata = 0x0500  // Linker's address
+   compile_time_string = 0x051A  // Linker's address
+   compile_time_ripdata = 0x053B  // Linker's address
+   
+   runtime_ripdata = 0x18000053B  // Actual runtime address
+   
+   offset = compile_time_ripdata - compile_time_string
+          = 0x053B - 0x051A
+          = 0x21
+   
+   runtime_string = runtime_ripdata - offset
+                  = 0x18000053B - 0x21
+                  = 0x18000051A
+   ```
+
+4. **LoadLibraryA receives 0x18000051A**
+   - Reads "user32.dll" correctly
+   - Loads the library
+
+## Benefits and Trade-offs
+
+### Benefits
+
+✅ **Works anywhere**: No matter where the shellcode is injected, it runs correctly
+
+✅ **No relocations**: The PE relocation section is not needed
+
+✅ **Self-contained**: All data is embedded and accessible
+
+✅ **Compact**: Small code size, no external dependencies
+
+### Trade-offs
+
+⚠️ **Initial setup**: Must call `RipStart()`/`RipData()` before using strings
+
+⚠️ **Wrapper functions**: Need `symbol<T>()` wrapper for every data access
+
+⚠️ **Architecture-specific**: Different offsets for x86 vs x64
+
+⚠️ **No global data**: Can't use global variables with initializers
+
+## Best Practices
+
+### Always Use symbol() for Data
+
+```cpp
+// ❌ Wrong - hardcoded address
+MsgBox(NULL, "Hello", "Caption", MB_OK);
+
+// ✅ Correct - position independent
+MsgBox(NULL, 
+    symbol<const char*>("Hello"), 
+    symbol<const char*>("Caption"), 
+    MB_OK);
+```
+
+### Cache RipStart Results
+
+Don't call `RipStart()` repeatedly:
+
+```cpp
+// ✅ Good - call once
+base.address = RipStart();
+// Use base.address multiple times
+
+// ❌ Wasteful
+auto addr1 = RipStart();
+auto addr2 = RipStart();  // Same result
+```
+
+### Mark Functions with declfn
+
+All your code should be in `.text$B`:
+
+```cpp
+auto declfn my_function() -> void {
+    // Implementation
+}
+```
+
+This ensures predictable section ordering.
+
+### Test at Different Addresses
+
+When testing, inject your shellcode at various addresses to verify position independence:
+
+```cpp
+// Allocate at different addresses
+VirtualAllocEx(hProcess, (LPVOID)0x10000000, ...);
+VirtualAllocEx(hProcess, (LPVOID)0x40000000, ...);
+VirtualAllocEx(hProcess, NULL, ...);  // Let OS choose
+```

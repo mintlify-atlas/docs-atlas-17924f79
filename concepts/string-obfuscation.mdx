@@ -1,0 +1,555 @@
+---
+title: "String Obfuscation"
+description: "Compile-time string hashing for stealth and API resolution"
+---
+
+## Why String Obfuscation?
+
+Shellcode often needs to hide its intent from static analysis tools. Storing API names and module names in plaintext makes your shellcode easily detectable:
+
+```cpp
+// ❌ Visible in any hex editor or strings tool
+LoadLibraryA("suspicious.dll");
+GetProcAddress(handle, "CreateRemoteThread");
+```
+
+Signature-based antivirus and EDR products scan for these patterns. String obfuscation solves this by:
+
+1. **Removing plaintext**: No literal "LoadLibraryA" in the binary
+2. **Hash-based lookup**: Use numeric hashes instead of strings
+3. **Compile-time computation**: Zero runtime overhead
+4. **Reduces size**: Hash values (4 bytes) vs full strings
+
+## Compile-Time FNV1a Hashing
+
+Stardust uses the FNV1a (Fowler-Noll-Vo) hash algorithm, computed entirely at compile time using C++20 `consteval`.
+
+### The Hash Function
+
+From `include/constexpr.h:20-39`:
+
+```cpp
+template <typename T = char>
+consteval auto hash_string(
+    const T* string
+) -> uint32_t {
+    uint32_t hash = 0x811c9dc5;  // FNV offset basis
+    uint8_t  byte = 0;
+
+    while ( * string ) {
+        byte = static_cast<uint8_t>( * string++ );
+
+        if ( byte >= 'a' ) {
+            byte -= 0x20;  // Convert to uppercase
+        }
+
+        hash ^= byte;
+        hash *= 0x01000193;  // FNV prime
+    }
+
+    return hash;
+}
+```
+
+### Algorithm Breakdown
+
+**FNV1a Algorithm:**
+
+1. Start with offset basis: `0x811c9dc5`
+2. For each byte:
+   - XOR hash with byte
+   - Multiply hash by FNV prime `0x01000193`
+3. Return 32-bit hash
+
+**Case Insensitive:**
+
+```cpp
+if ( byte >= 'a' ) {
+    byte -= 0x20;  // 'a' -> 'A'
+}
+```
+
+This ensures `"LoadLibraryA"` and `"loadlibrarya"` hash to the same value, matching Windows case-insensitive API resolution.
+
+### consteval Keyword
+
+The `consteval` specifier (C++20) forces compile-time evaluation:
+
+```cpp
+consteval auto hash_string(...) -> uint32_t
+```
+
+**Key properties:**
+
+- **Must** be evaluated at compile time (not runtime)
+- Produces a constant expression
+- If it can't be evaluated at compile time, compilation fails
+
+This guarantees zero runtime cost - the hash is already computed and embedded as a constant.
+
+### Template for String Types
+
+The template supports both narrow and wide strings:
+
+```cpp
+template <typename T = char>  // T can be char or wchar_t
+```
+
+**Usage:**
+
+```cpp
+// Narrow strings (char)
+auto hash1 = expr::hash_string<char>("LoadLibraryA");
+auto hash1 = expr::hash_string("LoadLibraryA");  // char is default
+
+// Wide strings (wchar_t) for module names
+auto hash2 = expr::hash_string<wchar_t>(L"kernel32.dll");
+```
+
+Wide strings are needed for module resolution because the PEB stores module names as `UNICODE_STRING` structures.
+
+## How String Hashing Avoids Detection
+
+### Before Obfuscation
+
+Traditional approach stores strings in plaintext:
+
+```cpp
+LOADLIBRARY pLoadLibrary = GetProcAddress(kernel32, "LoadLibraryA");
+```
+
+**In the binary:**
+
+```
+.rdata:00001000 4C 6F 61 64 4C 69 62 72  LoadLibr
+.rdata:00001008 61 72 79 41 00           aryA.
+```
+
+A simple `strings` command reveals:
+
+```bash
+$ strings shellcode.bin
+LoadLibraryA
+GetProcAddress
+CreateRemoteThread
+VirtualAllocEx
+```
+
+### After Obfuscation
+
+Stardust's approach using hashes:
+
+```cpp
+auto api = resolve::api<LOADLIBRARY>(
+    kernel32, 
+    expr::hash_string("LoadLibraryA")  // Computed at compile time
+);
+```
+
+**In the binary:**
+
+```
+.text:00001050  B8 9C 7A 14 E0  mov eax, 0xE0147A9C  ; Hash of "LoadLibraryA"
+```
+
+No string visible! Only a 32-bit hash value. Running `strings` finds nothing:
+
+```bash
+$ strings shellcode.bin
+(no API names found)
+```
+
+### Static Analysis Perspective
+
+**Without obfuscation:**
+- YARA rules can match: `"LoadLibraryA" and "GetProcAddress"`
+- Signature detection is trivial
+- Intent is obvious
+
+**With obfuscation:**
+- No string signatures to match
+- Must analyze behavior to detect
+- Harder to create static rules
+
+## Practical Usage
+
+### Module Resolution
+
+Resolving module handles from the PEB (`src/main.cc:26-28`):
+
+```cpp
+if ( ! (( ntdll.handle = resolve::module( 
+    expr::hash_string<wchar_t>( L"ntdll.dll" ) ) )) ) {
+    return;
+}
+```
+
+**What happens:**
+
+1. Compiler evaluates `expr::hash_string<wchar_t>(L"ntdll.dll")` at compile time
+2. Produces hash value: `0x1EDAB0ED`
+3. Embeds `0x1EDAB0ED` as a constant in the binary
+4. At runtime, `resolve::module()` walks the PEB comparing hashes
+
+### API Resolution
+
+Two methods for resolving function pointers:
+
+#### Method 1: RESOLVE_API Macro
+
+From the README example (`src/main.cc:59`):
+
+```cpp
+decltype( MessageBoxA ) * msgbox = RESOLVE_API( 
+    reinterpret_cast<uintptr_t>( user32 ), 
+    MessageBoxA 
+);
+```
+
+The macro (`include/resolve.h:9`):
+
+```cpp
+#define RESOLVE_API( m, s ) resolve::api<decltype(s)>( m, expr::hash_string( # s ) )
+```
+
+**Expansion:**
+
+```cpp
+resolve::api<decltype(MessageBoxA)>( 
+    reinterpret_cast<uintptr_t>(user32), 
+    expr::hash_string( "MessageBoxA" )  // Compile-time hash
+);
+```
+
+Benefits:
+- Automatically stringifies the function name with `# s`
+- Automatically infers the function type with `decltype(s)`
+- Clean, readable syntax
+
+#### Method 2: Direct Call
+
+Manual resolution:
+
+```cpp
+auto msgbox = resolve::api<decltype(MessageBoxA)>(
+    user32_handle,
+    expr::hash_string("MessageBoxA")
+);
+```
+
+Same result, more explicit.
+
+### Automatic Import Resolution
+
+The `RESOLVE_IMPORT` macro automates resolving all APIs in a module structure.
+
+From `include/macros.h:8-12`:
+
+```cpp
+#define RESOLVE_IMPORT( m ) { \
+    for ( int i = 1; i < expr::struct_count<decltype( instance::m )>(); i++ ) { \
+        reinterpret_cast<uintptr_t*>( &m )[ i ] = \
+            resolve::_api( m.handle, reinterpret_cast<uintptr_t*>( &m )[ i ] ); \
+    } \
+}
+```
+
+**Usage in constructor (`src/main.cc:38-39`):**
+
+```cpp
+RESOLVE_IMPORT( ntdll );
+RESOLVE_IMPORT( kernel32 );
+```
+
+**How it works:**
+
+1. The instance structure stores hashes in place of function pointers initially:
+   ```cpp
+   struct {
+       uintptr_t handle;
+       struct {
+           decltype(LoadLibraryA)* LoadLibraryA;    // Initially contains hash
+           decltype(GetProcAddress)* GetProcAddress; // Initially contains hash
+       };
+   } kernel32 = {
+       RESOLVE_TYPE( LoadLibraryA ),     // Expands to hash
+       RESOLVE_TYPE( GetProcAddress )    // Expands to hash
+   };
+   ```
+
+2. `RESOLVE_IMPORT` iterates through each field (skipping the `handle`)
+
+3. Treats the stored value as a hash
+
+4. Calls `resolve::_api()` to find the real function address
+
+5. Replaces the hash with the actual function pointer
+
+**After resolution:**
+
+```cpp
+kernel32.LoadLibraryA    // Now points to real LoadLibraryA in memory
+kernel32.GetProcAddress  // Now points to real GetProcAddress
+```
+
+## Hash Collision Considerations
+
+### Collision Probability
+
+FNV1a produces 32-bit hashes, giving 2^32 (4,294,967,296) possible values.
+
+**Birthday paradox**: With ~65,536 strings, collision probability reaches ~50%.
+
+However, typical shellcode resolves:
+- ~10-20 module names
+- ~50-100 function names
+
+At this scale, collision probability is extremely low (less than 0.01%).
+
+### Handling Collisions
+
+If you encounter a collision:
+
+#### Option 1: Verify Manually
+
+```cpp
+auto api_ptr = resolve::_api(module, hash);
+if (api_ptr) {
+    // Found something, verify it's correct by testing behavior
+    auto result = reinterpret_cast<MY_FUNC*>(api_ptr)(test_args);
+}
+```
+
+#### Option 2: Use Full String Match
+
+Fallback to a runtime string comparison:
+
+```cpp
+auto verify_api(uintptr_t module, uint32_t hash, const char* name) {
+    auto addr = resolve::_api(module, hash);
+    
+    // If collision suspected, verify with actual name
+    if (addr) {
+        auto actual_name = get_export_name(module, addr);
+        if (strcmp(actual_name, name) != 0) {
+            return 0;  // Collision detected
+        }
+    }
+    
+    return addr;
+}
+```
+
+#### Option 3: Different Hash Algorithm
+
+Implement an alternative hash (e.g., CRC32, xxHash) for colliding strings.
+
+### Real-World Risk
+
+In practice, collisions are rare because:
+
+1. Windows API names are unique by design
+2. Module names don't overlap
+3. FNV1a distributes well for ASCII strings
+
+You're more likely to encounter bugs than collisions.
+
+## Runtime vs Compile-Time Hashing
+
+### Compile-Time (consteval)
+
+From `include/constexpr.h:20-39`:
+
+```cpp
+consteval auto hash_string(const T* string) -> uint32_t
+```
+
+**Advantages:**
+- ✅ Zero runtime cost
+- ✅ Hash computed during compilation
+- ✅ Binary contains only the hash value
+- ✅ Smaller code size
+
+**Usage:** When the string is known at compile time (API names, module names).
+
+### Runtime Hashing
+
+Stardust also provides a runtime version (`include/common.h:82-100`):
+
+```cpp
+template<typename T = char>
+inline auto declfn hash_string(
+    _In_ const T* string
+) -> uint32_t {
+    uint32_t hash = 0x811c9dc5;
+    uint8_t  byte = 0;
+
+    while ( * string ) {
+        byte = static_cast<uint8_t>( * string++ );
+
+        if ( byte >= 'a' ) {
+            byte -= 0x20;
+        }
+
+        hash ^= byte;
+        hash *= 0x01000193;
+    }
+
+    return hash;
+}
+```
+
+Same algorithm, but uses `inline` instead of `consteval`.
+
+**Usage:** When the string is only known at runtime:
+
+```cpp
+// At runtime, hash a dynamically constructed string
+char buffer[256];
+sprintf(buffer, "api_%d", some_value);
+auto hash = stardust::hash_string(buffer);
+```
+
+### When to Use Each
+
+| Scenario | Use |
+|----------|-----|
+| Literal strings known at compile time | `expr::hash_string<T>("...")` |
+| Dynamic strings constructed at runtime | `stardust::hash_string<T>(buffer)` |
+| Module names in PEB walking | Compile-time (`expr::`) |
+| Export table name parsing | Runtime (`stardust::`) |
+| Comparing user input | Runtime (`stardust::`) |
+
+### Export Table Resolution
+
+The runtime hasher is used when walking export tables (`src/resolve.cc:76-80`):
+
+```cpp
+for ( int i = 0; i < export_dir->NumberOfNames; i++ ) {
+    symbol_name = reinterpret_cast<PSTR>( module_base + export_names[ i ] );
+
+    if ( stardust::hash_string( symbol_name ) != symbol_hash ) {
+        continue;
+    }
+    
+    // Found matching hash
+    address = module_base + export_addrs[ export_ordns[ i ] ];
+    break;
+}
+```
+
+**Why runtime here?**
+
+The export table contains actual string names. We hash them at runtime to compare against our compile-time hash.
+
+**Flow:**
+
+1. Compile time: `expr::hash_string("LoadLibraryA")` → `0xE0147A9C`
+2. Runtime: Find "LoadLibraryA" in export table
+3. Runtime: `stardust::hash_string("LoadLibraryA")` → `0xE0147A9C`
+4. Compare: `0xE0147A9C == 0xE0147A9C` ✅ Match!
+5. Return function address
+
+## Benefits Summary
+
+### Stealth
+
+✅ **No plaintext API names**: Static analysis tools can't trivially identify intent
+
+✅ **Signature evasion**: YARA rules based on strings won't match
+
+✅ **Obfuscated imports**: Function resolution doesn't expose plaintext names
+
+### Performance
+
+✅ **Compile-time computation**: Zero runtime cost for hash calculation
+
+✅ **Small constants**: 4-byte hashes instead of variable-length strings
+
+✅ **Cache friendly**: Integer comparisons are fast
+
+### Code Quality
+
+✅ **Type-safe**: Template-based, compiler-enforced correctness
+
+✅ **Readable**: `expr::hash_string("API")` is clear and concise
+
+✅ **Maintainable**: Change an API name in one place, hash updates automatically
+
+## Example: Adding Obfuscated API
+
+Let's add `VirtualProtect` to the shellcode:
+
+### 1. Update Instance Structure
+
+```cpp
+struct {
+    uintptr_t handle;
+    struct {
+        D_API( LoadLibraryA )
+        D_API( GetProcAddress )
+        D_API( VirtualProtect )  // Add this
+    };
+} kernel32 = {
+    RESOLVE_TYPE( LoadLibraryA ),
+    RESOLVE_TYPE( GetProcAddress ),
+    RESOLVE_TYPE( VirtualProtect )   // Add this
+};
+```
+
+### 2. Automatic Resolution
+
+The constructor automatically resolves it:
+
+```cpp
+RESOLVE_IMPORT( kernel32 );  // Resolves all APIs including VirtualProtect
+```
+
+### 3. Use It
+
+```cpp
+DWORD old_protect;
+kernel32.VirtualProtect(
+    address, 
+    size, 
+    PAGE_EXECUTE_READWRITE, 
+    &old_protect
+);
+```
+
+### What Gets Compiled
+
+Compiler output:
+
+```
+; Hash of "VirtualProtect" embedded as constant
+mov eax, 0x36F8C45B    ; expr::hash_string("VirtualProtect")
+```
+
+No string "VirtualProtect" exists in the binary - only the hash `0x36F8C45B`.
+
+## Advanced: Custom Hash Functions
+
+You can implement alternative hash algorithms for specific use cases:
+
+```cpp
+namespace expr {
+    // DJB2 hash (another popular choice)
+    template <typename T = char>
+    consteval auto djb2_hash(
+        const T* string
+    ) -> uint32_t {
+        uint32_t hash = 5381;
+        
+        while (*string) {
+            uint8_t byte = static_cast<uint8_t>(*string++);
+            if (byte >= 'a') byte -= 0x20;
+            hash = ((hash << 5) + hash) + byte;  // hash * 33 + byte
+        }
+        
+        return hash;
+    }
+}
+```
+
+Use this if FNV1a produces collisions in your specific set of strings.

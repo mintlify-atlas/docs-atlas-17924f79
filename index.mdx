@@ -1,97 +1,217 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Stardust"
+description: "A modern 32/64-bit position independent shellcode template for Windows"
+mode: "custom"
 ---
 
-## Setting up
+<div className="relative overflow-hidden bg-gradient-to-br from-[#1c1c1f] via-[#242838] to-[#1c1c1f] dark:from-[#1c1c1f] dark:via-[#242838] dark:to-[#1c1c1f] py-20 px-4">
+  <div className="max-w-6xl mx-auto">
+    <div className="grid lg:grid-cols-12 gap-8 items-center">
+      <div className="lg:col-span-7">
+        <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold text-white mb-6">
+          Modern Shellcode Template
+        </h1>
+        <p className="text-lg sm:text-xl text-gray-300 dark:text-gray-300 max-w-2xl mb-8">
+          Build position-independent implants for 32/64-bit Windows with compile-time string hashing, dynamic API resolution, and modern C++20 features.
+        </p>
+        <div className="flex flex-wrap gap-4">
+          <a 
+            href="/quickstart" 
+            className="inline-flex items-center px-6 py-3 bg-[#9b8de0] hover:bg-[#b497d6] text-white font-semibold rounded-full transition-colors no-underline"
+          >
+            Get Started
+          </a>
+          <a 
+            href="/api/resolve" 
+            className="inline-flex items-center px-6 py-3 bg-transparent border-2 border-[#9b8de0] hover:border-[#b497d6] text-[#9b8de0] hover:text-[#b497d6] font-semibold rounded-full transition-colors no-underline"
+          >
+            API Reference
+          </a>
+        </div>
+      </div>
+      <div className="lg:col-span-5 hidden lg:block">
+        <div className="relative">
+          <div className="absolute inset-0 bg-gradient-to-r from-[#9b8de0] to-[#b497d6] rounded-2xl blur-3xl opacity-20"></div>
+          <div className="relative bg-[#1c1c1f] dark:bg-[#1c1c1f] p-6 rounded-2xl border border-[#a78bfa] dark:border-[#a78bfa]">
+            <pre className="text-sm text-gray-300 dark:text-gray-300 overflow-x-auto">
+{`// Position-independent code
+auto user32 = kernel32.LoadLibraryA(
+  symbol<const char*>("user32.dll")
+);
 
-Get your documentation site up and running in minutes.
+auto msgbox = RESOLVE_API(
+  reinterpret_cast<uintptr_t>(user32),
+  MessageBoxA
+);
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+msgbox(nullptr, 
+  symbol<const char*>("Hello"),
+  symbol<const char*>("Stardust"),
+  MB_OK);`}
+            </pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
-## Make it yours
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="mb-12">
+    <h2 className="text-2xl sm:text-3xl font-semibold text-gray-900 dark:text-white mb-3">
+      Quick Start
+    </h2>
+    <p className="text-base text-gray-600 dark:text-gray-400">
+      Get up and running with Stardust in minutes
+    </p>
+  </div>
 
-Design a docs site that looks great and empowers your users.
+  <Steps>
+    <Step title="Clone the repository">
+      Get the Stardust template and navigate to the directory.
+      
+      ```bash
+      git clone https://github.com/Cracked5pider/Stardust.git
+      cd Stardust
+      ```
+    </Step>
+    
+    <Step title="Build the shellcode">
+      Compile both 32-bit and 64-bit versions of the shellcode.
+      
+      ```bash
+      make
+      ```
+      
+      This produces `bin/stardust.x64.bin` and `bin/stardust.x86.bin`.
+    </Step>
+    
+    <Step title="Test your shellcode">
+      Use the included module stomping test utility to execute your shellcode.
+      
+      ```bash
+      make stomper
+      ./test/stomper.x64.exe bin/stardust.x64.bin
+      ```
+      
+      You should see a MessageBox appear with "Hello world".
+    </Step>
+  </Steps>
+</div>
 
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
-  </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
-  </Card>
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="mb-12">
+    <h2 className="text-2xl sm:text-3xl font-semibold text-gray-900 dark:text-white mb-3">
+      Core Features
+    </h2>
+    <p className="text-base text-gray-600 dark:text-gray-400">
+      Everything you need to build modern implants
+    </p>
+  </div>
+
+  <CardGroup cols={2}>
     <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
-  </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
-  </Card>
-</Columns>
+      title="Position Independence"
+      icon="location-dot"
+      href="/concepts/position-independence"
+    >
+      Write shellcode that runs from any memory address with full PIC support.
+    </Card>
+    <Card
+      title="API Resolution"
+      icon="magnifying-glass"
+      href="/concepts/api-resolution"
+    >
+      Dynamically resolve Windows APIs from PEB at runtime using hash-based lookup.
+    </Card>
+    <Card
+      title="String Obfuscation"
+      icon="shield-halved"
+      href="/concepts/string-obfuscation"
+    >
+      Compile-time FNV1a hashing to hide strings from static analysis.
+    </Card>
+    <Card
+      title="Debug Support"
+      icon="bug"
+      href="/guides/debugging"
+    >
+      Built-in debug mode with DbgPrint for development and testing.
+    </Card>
+  </CardGroup>
+</div>
 
-## Create beautiful pages
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="mb-12">
+    <h2 className="text-2xl sm:text-3xl font-semibold text-gray-900 dark:text-white mb-3">
+      Explore the Documentation
+    </h2>
+    <p className="text-base text-gray-600 dark:text-gray-400">
+      Learn how to customize and extend Stardust for your needs
+    </p>
+  </div>
 
-Everything you need to create world-class documentation.
+  <CardGroup cols={3}>
+    <Card
+      title="Architecture"
+      icon="sitemap"
+      href="/concepts/architecture"
+    >
+      Understand how Stardust components work together.
+    </Card>
+    <Card
+      title="Adding APIs"
+      icon="plus"
+      href="/guides/adding-apis"
+    >
+      Extend your implant with custom Windows APIs.
+    </Card>
+    <Card
+      title="Module Stomping"
+      icon="hammer"
+      href="/guides/module-stomping"
+    >
+      Learn the module stomping injection technique.
+    </Card>
+    <Card
+      title="Basic Example"
+      icon="code"
+      href="/examples/basic-messagebox"
+    >
+      Walk through the default MessageBox implementation.
+    </Card>
+    <Card
+      title="API Reference"
+      icon="book"
+      href="/api/resolve"
+    >
+      Complete reference for all Stardust APIs.
+    </Card>
+    <Card
+      title="Building"
+      icon="wrench"
+      href="/building"
+    >
+      Build options, compiler flags, and optimization.
+    </Card>
+  </CardGroup>
+</div>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
-
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<div className="mt-20 mb-16 max-w-5xl mx-auto px-6">
+  <div className="bg-gradient-to-br from-[#1c1c1f] to-[#242838] dark:from-[#1c1c1f] dark:to-[#242838] rounded-2xl p-8 sm:p-12 border border-[#a78bfa] dark:border-[#a78bfa]">
+    <div className="max-w-3xl">
+      <h2 className="text-2xl sm:text-3xl font-bold text-white mb-4">
+        Ready to build your first implant?
+      </h2>
+      <p className="text-lg text-gray-300 dark:text-gray-300 mb-6">
+        Follow our quickstart guide to compile and test Stardust shellcode in under 5 minutes.
+      </p>
+      <a 
+        href="/quickstart" 
+        className="inline-flex items-center px-6 py-3 bg-[#9b8de0] hover:bg-[#b497d6] text-white font-semibold rounded-full transition-colors no-underline"
+      >
+        Get Started Now
+      </a>
+    </div>
+  </div>
+</div>

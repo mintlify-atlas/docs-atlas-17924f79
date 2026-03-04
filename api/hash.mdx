@@ -1,0 +1,245 @@
+---
+title: 'Hash Functions'
+description: 'FNV-1a hashing for compile-time and runtime symbol obfuscation'
+---
+
+Stardust implements the FNV-1a (Fowler-Noll-Vo) hash algorithm for both compile-time and runtime string hashing. This enables API resolution without storing plaintext function names in the compiled shellcode.
+
+## FNV-1a Algorithm
+
+FNV-1a is a fast, non-cryptographic hash function that produces 32-bit hashes. The implementation uses:
+
+- **Offset Basis:** `0x811c9dc5`
+- **FNV Prime:** `0x01000193`
+- **Case Normalization:** Converts lowercase ASCII to uppercase (`a-z` → `A-Z`)
+- **32-bit Output:** Suitable for hash table lookups
+
+### Algorithm Steps
+
+1. Initialize hash to `0x811c9dc5`
+2. For each character:
+   - Convert lowercase to uppercase (subtract `0x20` if `>= 'a'`)
+   - XOR hash with byte value
+   - Multiply hash by `0x01000193`
+3. Return final 32-bit hash
+
+---
+
+## expr::hash_string()
+
+Compile-time consteval hash function that computes string hashes during compilation.
+
+```cpp
+template <typename T = char>
+consteval auto hash_string(
+    const T* string
+) -> uint32_t;
+```
+
+<ParamField path="string" type="const T*">
+  Pointer to null-terminated string. Supports both `char` and `wchar_t` types.
+</ParamField>
+
+<ParamField path="T" type="template typename" default="char">
+  Character type - either `char` for ANSI strings or `wchar_t` for Unicode strings.
+</ParamField>
+
+<ResponseField name="return" type="uint32_t">
+  32-bit FNV-1a hash computed at compile-time.
+</ResponseField>
+
+### Characteristics
+
+- **Compile-Time Evaluation:** `consteval` keyword forces computation during compilation
+- **Zero Runtime Cost:** Hash values are embedded as constants in the binary
+- **Template Support:** Works with both narrow (`char`) and wide (`wchar_t`) strings
+- **Case-Insensitive:** Automatically normalizes ASCII characters to uppercase
+
+### Example Usage
+
+```cpp
+// ANSI string hashing (char)
+constexpr auto kernel32_hash = expr::hash_string("kernel32.dll");
+constexpr auto loadlib_hash = expr::hash_string("LoadLibraryA");
+
+// Wide string hashing (wchar_t) - required for module names
+constexpr auto ntdll_hash = expr::hash_string<wchar_t>(L"ntdll.dll");
+constexpr auto user32_hash = expr::hash_string<wchar_t>(L"user32.dll");
+
+// Using in API resolution
+auto module_base = resolve::module(
+    expr::hash_string<wchar_t>(L"kernel32.dll")
+);
+```
+
+### Implementation
+
+```cpp
+template <typename T = char>
+consteval auto hash_string(const T* string) -> uint32_t {
+    uint32_t hash = 0x811c9dc5;  // FNV offset basis
+    uint8_t  byte = 0;
+
+    while (*string) {
+        byte = static_cast<uint8_t>(*string++);
+        
+        // Normalize to uppercase
+        if (byte >= 'a') {
+            byte -= 0x20;
+        }
+        
+        hash ^= byte;              // XOR with byte
+        hash *= 0x01000193;        // Multiply by FNV prime
+    }
+
+    return hash;
+}
+```
+
+<Tip>
+  Always use `wchar_t` when hashing module names for `resolve::module()`, as Windows stores DLL names in Unicode format in the PEB.
+</Tip>
+
+---
+
+## stardust::hash_string()
+
+Runtime hash function for dynamic string hashing during shellcode execution.
+
+```cpp
+template<typename T = char>
+inline auto declfn hash_string(
+    _In_ const T* string
+) -> uint32_t;
+```
+
+<ParamField path="string" type="const T*">
+  Pointer to null-terminated string to hash. Supports `char` and `wchar_t`.
+</ParamField>
+
+<ParamField path="T" type="template typename" default="char">
+  Character type - `char` for ANSI or `wchar_t` for Unicode strings.
+</ParamField>
+
+<ResponseField name="return" type="uint32_t">
+  32-bit FNV-1a hash computed at runtime.
+</ResponseField>
+
+### Characteristics
+
+- **Runtime Evaluation:** Computed during shellcode execution
+- **Section Attribute:** `declfn` places function in `.text$B` section
+- **Dynamic Input:** Can hash strings from memory, PEB structures, or user input
+- **Identical Algorithm:** Produces same hashes as `expr::hash_string()`
+
+### Example Usage
+
+```cpp
+// Hashing module names from PEB at runtime
+RangeHeadList(NtCurrentPeb()->Ldr->InLoadOrderModuleList, PLDR_DATA_TABLE_ENTRY, {
+    auto dll_hash = stardust::hash_string<wchar_t>(Entry->BaseDllName.Buffer);
+    if (dll_hash == target_hash) {
+        // Found matching module
+    }
+})
+
+// Hashing export names during API resolution
+for (int i = 0; i < export_dir->NumberOfNames; i++) {
+    symbol_name = reinterpret_cast<PSTR>(module_base + export_names[i]);
+    if (stardust::hash_string(symbol_name) == symbol_hash) {
+        // Found matching export
+    }
+}
+```
+
+### Implementation
+
+```cpp
+template<typename T = char>
+inline auto declfn hash_string(_In_ const T* string) -> uint32_t {
+    uint32_t hash = 0x811c9dc5;
+    uint8_t  byte = 0;
+
+    while (*string) {
+        byte = static_cast<uint8_t>(*string++);
+        
+        if (byte >= 'a') {
+            byte -= 0x20;  // Case normalization
+        }
+        
+        hash ^= byte;
+        hash *= 0x01000193;
+    }
+
+    return hash;
+}
+```
+
+<Info>
+  The `declfn` attribute (`__attribute__((section(".text$B")))`) ensures the function is placed in the correct position-independent code section during linking.
+</Info>
+
+---
+
+## Compile-Time vs Runtime
+
+| Feature | `expr::hash_string()` | `stardust::hash_string()` |
+|---------|----------------------|---------------------------|
+| **Evaluation** | Compile-time (`consteval`) | Runtime (`inline`) |
+| **Use Case** | Static string literals | Dynamic strings from memory |
+| **Performance** | Zero runtime cost | Fast runtime computation |
+| **Placement** | Embedded as constants | `.text$B` section |
+| **Typical Usage** | Macro expansions, API lookups | PEB iteration, export parsing |
+
+### When to Use Each
+
+**Use `expr::hash_string()` when:**
+- Hashing known string literals at compile time
+- Working with `RESOLVE_API()` or `RESOLVE_TYPE()` macros
+- Initializing constant hash values
+
+**Use `stardust::hash_string()` when:**
+- Hashing strings from PEB structures
+- Parsing PE export tables
+- Processing dynamic or runtime-provided strings
+
+---
+
+## Hash Collision Considerations
+
+<Warning>
+  FNV-1a is not cryptographically secure. While collisions are rare for typical Windows API names, they are theoretically possible. For critical applications, verify resolved function addresses through additional validation.
+</Warning>
+
+### Collision Probability
+
+With a 32-bit hash space and ~2,000 exported functions per typical Windows DLL:
+- **Collision probability:** ~0.0005% per DLL
+- **Mitigation:** Hashing algorithm includes case normalization
+- **Best Practice:** Test hash uniqueness in your target environment
+
+---
+
+## Example: Complete Hash-Based Resolution
+
+```cpp
+// Compile-time hash computation
+constexpr auto kernel32_hash = expr::hash_string<wchar_t>(L"kernel32.dll");
+constexpr auto loadlib_hash = expr::hash_string("LoadLibraryA");
+
+// Runtime module resolution
+auto kernel32_base = resolve::module(kernel32_hash);
+
+// Runtime API resolution (uses stardust::hash_string internally)
+auto LoadLib = resolve::api<decltype(LoadLibraryA)>(
+    kernel32_base,
+    loadlib_hash
+);
+
+// Load additional module
+auto user32 = LoadLib("user32.dll");
+```
+
+<Tip>
+  Store computed hashes in `constexpr` variables for better code readability and to ensure compile-time evaluation.
+</Tip>

@@ -1,0 +1,204 @@
+---
+title: 'resolve'
+description: 'Module and API resolution functions for dynamic symbol resolution'
+---
+
+The `resolve` namespace provides functions for dynamically resolving Windows modules and exported functions using FNV-1a hash-based lookups. This enables position-independent shellcode to locate and call Windows APIs without hardcoded addresses.
+
+## resolve::module()
+
+Searches for a loaded module's base address by its FNV-1a name hash.
+
+```cpp
+auto declfn resolve::module(
+   _In_ const uint32_t library_hash
+) -> uintptr_t;
+```
+
+<ParamField path="library_hash" type="uint32_t">
+  FNV-1a hash of the library name (case-insensitive). Pass `0` to retrieve the base address of the first module in load order.
+</ParamField>
+
+<ResponseField name="return" type="uintptr_t">
+  Base address of the module if found, otherwise `0`.
+</ResponseField>
+
+### Implementation Details
+
+- Iterates through the `InLoadOrderModuleList` linked list in the Process Environment Block (PEB)
+- Compares the hash of each module's `BaseDllName` against the provided hash
+- Uses case-insensitive hashing to match module names
+- Returns the first matching module's `DllBase`
+
+### Example Usage
+
+```cpp
+// Find ntdll.dll base address
+auto ntdll_base = resolve::module(
+    expr::hash_string<wchar_t>(L"ntdll.dll")
+);
+
+// Get the first loaded module (typically the main executable)
+auto first_module = resolve::module(0);
+```
+
+<Note>
+  Module names must be hashed as wide-character strings (`wchar_t`) since Windows stores module names in Unicode format in the PEB.
+</Note>
+
+---
+
+## resolve::api()
+
+Resolves a function export from a module using hash-based lookup with automatic type casting.
+
+```cpp
+template <typename T>
+inline auto declfn api(
+    _In_ const uintptr_t module_base,
+    _In_ const uintptr_t symbol_hash
+) -> T*;
+```
+
+<ParamField path="module_base" type="uintptr_t">
+  Base address of the module to resolve the function from (obtained via `resolve::module()`).
+</ParamField>
+
+<ParamField path="symbol_hash" type="uintptr_t">
+  FNV-1a hash of the export symbol name (case-insensitive).
+</ParamField>
+
+<ParamField path="T" type="template typename">
+  Function signature type for automatic casting of the returned pointer.
+</ParamField>
+
+<ResponseField name="return" type="T*">
+  Typed function pointer cast to the specified template type, or `nullptr` if not found.
+</ResponseField>
+
+### Example Usage
+
+```cpp
+// Resolve LoadLibraryA from kernel32
+auto kernel32 = resolve::module(expr::hash_string<wchar_t>(L"kernel32.dll"));
+auto LoadLib = resolve::api<decltype(LoadLibraryA)>(
+    kernel32,
+    expr::hash_string("LoadLibraryA")
+);
+
+// Using the RESOLVE_API macro (recommended)
+decltype(MessageBoxA)* msgbox = RESOLVE_API(
+    user32_base,
+    MessageBoxA
+);
+```
+
+<Tip>
+  Use the `RESOLVE_API()` macro for cleaner syntax. It automatically computes the hash at compile-time and casts to the correct type.
+</Tip>
+
+---
+
+## resolve::_api()
+
+Internal implementation function that performs the actual symbol resolution by parsing PE export tables.
+
+```cpp
+auto declfn resolve::_api(
+    _In_ const uintptr_t module_base,
+    _In_ const uintptr_t symbol_hash
+) -> uintptr_t;
+```
+
+<ParamField path="module_base" type="uintptr_t">
+  Base address of the PE module.
+</ParamField>
+
+<ParamField path="symbol_hash" type="uintptr_t">
+  FNV-1a hash of the symbol name to locate.
+</ParamField>
+
+<ResponseField name="return" type="uintptr_t">
+  Address of the resolved function, or `0` if not found or if the PE headers are invalid.
+</ResponseField>
+
+### Implementation Algorithm
+
+1. **Validate DOS Header** - Checks for `IMAGE_DOS_SIGNATURE` ("MZ")
+2. **Validate NT Header** - Verifies `IMAGE_NT_SIGNATURE` ("PE\0\0")
+3. **Locate Export Directory** - Retrieves the export table from the PE Optional Header
+4. **Parse Export Tables** - Reads:
+   - `AddressOfNames` - Array of export name RVAs
+   - `AddressOfFunctions` - Array of function RVAs
+   - `AddressOfNameOrdinals` - Array mapping names to function indices
+5. **Hash Comparison** - Iterates through exported names, hashing each and comparing against `symbol_hash`
+6. **Address Calculation** - On match, resolves the final function address using the ordinal mapping
+
+### Low-Level Details
+
+```cpp
+// Parsing PE structures
+dos_header = reinterpret_cast<PIMAGE_DOS_HEADER>(module_base);
+nt_header  = reinterpret_cast<PIMAGE_NT_HEADERS>(module_base + dos_header->e_lfanew);
+export_dir = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(
+    module_base + nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress
+);
+
+// Iterating exports
+for (int i = 0; i < export_dir->NumberOfNames; i++) {
+    symbol_name = reinterpret_cast<PSTR>(module_base + export_names[i]);
+    if (stardust::hash_string(symbol_name) == symbol_hash) {
+        address = module_base + export_addrs[export_ordns[i]];
+        break;
+    }
+}
+```
+
+<Warning>
+  This function is intended for internal use. Prefer using `resolve::api<T>()` which provides type safety and automatic casting.
+</Warning>
+
+---
+
+## Helper Macros
+
+### RESOLVE_API()
+
+Convenience macro that combines compile-time hashing with typed API resolution.
+
+```cpp
+#define RESOLVE_API(m, s) resolve::api<decltype(s)>(m, expr::hash_string(#s))
+```
+
+**Parameters:**
+- `m` - Module base address
+- `s` - Function name (unquoted symbol)
+
+**Example:**
+```cpp
+auto msgbox = RESOLVE_API(user32_base, MessageBoxA);
+```
+
+### RESOLVE_TYPE()
+
+Macro for initializing structure members with hashed values for batch resolution.
+
+```cpp
+#define RESOLVE_TYPE(s) .s = reinterpret_cast<decltype(s)*>(expr::hash_string(#s))
+```
+
+**Usage:**
+```cpp
+struct {
+    uintptr_t handle;
+    D_API(LoadLibraryA)
+    D_API(GetProcAddress)
+} kernel32 = {
+    RESOLVE_TYPE(LoadLibraryA),
+    RESOLVE_TYPE(GetProcAddress)
+};
+```
+
+<Info>
+  See the [macros](/api/macros) documentation for more details on batch API resolution patterns.
+</Info>

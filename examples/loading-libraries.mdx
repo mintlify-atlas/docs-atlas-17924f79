@@ -1,0 +1,376 @@
+---
+title: 'Loading Additional Libraries'
+description: 'Learn how to load libraries at runtime and extend module functionality'
+icon: 'book'
+---
+
+## Overview
+
+Stardust provides two primary methods for accessing Windows APIs:
+1. **PEB Resolution**: Loading modules already loaded in the process
+2. **Runtime Loading**: Dynamically loading new libraries with `LoadLibraryA`
+
+This guide covers both approaches and best practices for module management.
+
+## Loading from PEB vs Runtime
+
+### Method 1: PEB Resolution
+
+**Best for**: Core system libraries (ntdll.dll, kernel32.dll, kernelbase.dll)
+
+```cpp
+// These libraries are typically already loaded
+if (!(ntdll.handle = resolve::module(expr::hash_string<wchar_t>(L"ntdll.dll")))) {
+    return; // Critical failure
+}
+
+if (!(kernel32.handle = resolve::module(expr::hash_string<wchar_t>(L"kernel32.dll")))) {
+    return; // Critical failure
+}
+```
+
+**Advantages:**
+- No system calls required
+- Already loaded in most processes
+- Stealthy - no additional loading artifacts
+- Faster than LoadLibrary
+
+**How it works:**
+
+The `resolve::module()` function walks the Process Environment Block (PEB):
+
+```cpp src/resolve.cc
+auto declfn resolve::module(
+   _In_ const uint32_t library_hash
+) -> uintptr_t {
+    // Iterate over the linked list
+    RangeHeadList( NtCurrentPeb()->Ldr->InLoadOrderModuleList, PLDR_DATA_TABLE_ENTRY, {
+        if ( !library_hash ) {
+            return reinterpret_cast<uintptr_t>( Entry->DllBase );
+        }
+
+        if ( stardust::hash_string<wchar_t>( Entry->BaseDllName.Buffer ) == library_hash ) {
+            return reinterpret_cast<uintptr_t>( Entry->DllBase ); 
+        }
+    } )
+
+    return 0;
+}
+```
+
+**Key Points:**
+- Accesses `PEB->Ldr->InLoadOrderModuleList`
+- Iterates through `LDR_DATA_TABLE_ENTRY` structures
+- Matches against FNV-1a hash of `BaseDllName`
+- Returns module base address or 0 if not found
+
+### Method 2: Runtime Loading
+
+**Best for**: Non-core libraries (user32.dll, advapi32.dll, wininet.dll, etc.)
+
+```cpp
+const auto user32 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll"));
+
+if (!user32) {
+    // Handle error - library couldn't be loaded
+    return;
+}
+
+// Now resolve APIs from the loaded library
+auto msgbox = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), MessageBoxA);
+```
+
+**Advantages:**
+- Can load any library on the system
+- Works even if the library wasn't initially loaded
+- Required for non-standard libraries
+
+**Disadvantages:**
+- Creates events that can be monitored (DLL load events)
+- Slower than PEB resolution
+- May trigger security solutions
+
+## Complete Example: Loading Multiple Libraries
+
+### Step 1: Define Module Structures
+
+In `include/common.h`, add your module definitions:
+
+```cpp
+class instance {
+    struct {
+        uintptr_t address;
+        uintptr_t length;
+    } base = {};
+
+    // Kernel32 - loaded from PEB
+    struct {
+        uintptr_t handle;
+        struct {
+            D_API( LoadLibraryA )
+            D_API( GetProcAddress )
+            D_API( VirtualAlloc )
+            D_API( VirtualFree )
+            D_API( CreateThread )
+        };
+    } kernel32 = {
+        RESOLVE_TYPE( LoadLibraryA ),
+        RESOLVE_TYPE( GetProcAddress ),
+        RESOLVE_TYPE( VirtualAlloc ),
+        RESOLVE_TYPE( VirtualFree ),
+        RESOLVE_TYPE( CreateThread )
+    };
+
+    // Ntdll - loaded from PEB
+    struct {
+        uintptr_t handle;
+        struct {
+#ifdef DEBUG
+            D_API( DbgPrint )
+#endif
+            D_API( NtAllocateVirtualMemory )
+            D_API( NtProtectVirtualMemory )
+        };
+    } ntdll = {
+#ifdef DEBUG
+        RESOLVE_TYPE( DbgPrint ),
+#endif
+        RESOLVE_TYPE( NtAllocateVirtualMemory ),
+        RESOLVE_TYPE( NtProtectVirtualMemory )
+    };
+
+    // User32 - loaded at runtime (not in struct, resolved manually)
+
+public:
+    explicit instance();
+    auto start(_In_ void* arg) -> void;
+};
+```
+
+**Understanding the Macros:**
+
+```cpp include/macros.h
+// D_API creates a function pointer member
+#define D_API( x )  decltype( x ) * x;
+
+// RESOLVE_TYPE stores the hash value initially
+#define RESOLVE_TYPE( s )   .s = reinterpret_cast<decltype(s)*>( expr::hash_string( # s ) )
+
+// RESOLVE_IMPORT resolves all function pointers in a module struct
+#define RESOLVE_IMPORT( m ) { \
+    for ( int i = 1; i < expr::struct_count<decltype( instance::m )>(); i++ ) { \
+        reinterpret_cast<uintptr_t*>( &m )[ i ] = resolve::_api( m.handle, reinterpret_cast<uintptr_t*>( &m )[ i ] ); \
+    } \
+}
+```
+
+### Step 2: Initialize in Constructor
+
+```cpp src/main.cc
+declfn instance::instance(void) {
+    // Calculate shellcode boundaries
+    base.address = RipStart();
+    base.length = (RipData() - base.address) + END_OFFSET;
+
+    // Resolve ntdll from PEB
+    if (!(ntdll.handle = resolve::module(expr::hash_string<wchar_t>(L"ntdll.dll")))) {
+        return;
+    }
+
+    // Resolve kernel32 from PEB
+    if (!(kernel32.handle = resolve::module(expr::hash_string<wchar_t>(L"kernel32.dll")))) {
+        return;
+    }
+
+    // Automatically resolve all APIs
+    RESOLVE_IMPORT(ntdll);
+    RESOLVE_IMPORT(kernel32);
+}
+```
+
+### Step 3: Load Additional Libraries at Runtime
+
+```cpp src/main.cc
+auto declfn instance::start(_In_ void* arg) -> void {
+    // Load user32.dll
+    const auto user32 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll"));
+    if (!user32) {
+        DBG_PRINTF("Failed to load user32.dll\n");
+        return;
+    }
+
+    // Load advapi32.dll for registry operations
+    const auto advapi32 = kernel32.LoadLibraryA(symbol<const char*>("advapi32.dll"));
+    if (!advapi32) {
+        DBG_PRINTF("Failed to load advapi32.dll\n");
+        return;
+    }
+
+    // Resolve APIs from user32
+    auto MessageBoxA = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), MessageBoxA);
+    auto GetDesktopWindow = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), GetDesktopWindow);
+
+    // Resolve APIs from advapi32
+    auto RegOpenKeyExA = RESOLVE_API(reinterpret_cast<uintptr_t>(advapi32), RegOpenKeyExA);
+    auto RegCloseKey = RESOLVE_API(reinterpret_cast<uintptr_t>(advapi32), RegCloseKey);
+
+    // Use the resolved APIs
+    auto desktop = GetDesktopWindow();
+    MessageBoxA(desktop, 
+                symbol<const char*>("Multiple libraries loaded!"),
+                symbol<const char*>("Success"),
+                MB_OK);
+}
+```
+
+## Advanced Pattern: Module Manager
+
+For more complex shellcode, create a helper function:
+
+```cpp
+struct ModuleInfo {
+    uintptr_t base;
+    const char* name;
+};
+
+auto declfn load_module(const char* name) -> uintptr_t {
+    // Try PEB first
+    auto hash = stardust::hash_string<wchar_t>(
+        /* convert to wchar_t */
+    );
+    
+    auto base = resolve::module(hash);
+    if (base) {
+        DBG_PRINTF("Found %s in PEB at %p\n", name, base);
+        return base;
+    }
+
+    // Fall back to LoadLibrary
+    base = reinterpret_cast<uintptr_t>(
+        kernel32.LoadLibraryA(symbol<const char*>(name))
+    );
+    
+    if (base) {
+        DBG_PRINTF("Loaded %s at %p\n", name, base);
+    } else {
+        DBG_PRINTF("Failed to load %s\n", name);
+    }
+    
+    return base;
+}
+```
+
+## Best Practices
+
+### 1. Minimize Runtime Loading
+
+**Good:**
+```cpp
+// Load once, use many times
+const auto user32 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll"));
+auto MessageBoxA = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), MessageBoxA);
+auto GetDesktopWindow = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), GetDesktopWindow);
+auto SendMessageA = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), SendMessageA);
+```
+
+**Bad:**
+```cpp
+// Multiple loads of the same library
+auto user32_1 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll"));
+// ... use it ...
+auto user32_2 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll")); // Wasteful!
+```
+
+### 2. Error Handling
+
+**Always validate:**
+```cpp
+const auto module = kernel32.LoadLibraryA(symbol<const char*>("somelib.dll"));
+if (!module) {
+    // Gracefully handle failure
+    DBG_PRINTF("Failed to load library\n");
+    return;
+}
+
+auto func = RESOLVE_API(reinterpret_cast<uintptr_t>(module), SomeFunction);
+if (!func) {
+    DBG_PRINTF("Failed to resolve function\n");
+    return;
+}
+```
+
+### 3. Load Order Matters
+
+**Correct order:**
+```cpp
+// 1. Resolve core modules from PEB first
+if (!(kernel32.handle = resolve::module(expr::hash_string<wchar_t>(L"kernel32.dll")))) {
+    return; // Can't continue without kernel32
+}
+RESOLVE_IMPORT(kernel32);
+
+// 2. Now we can use LoadLibraryA
+const auto user32 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll"));
+```
+
+### 4. Module Cleanup (Optional)
+
+For long-running shellcode:
+```cpp
+// Free libraries when done
+if (user32) {
+    kernel32.FreeLibrary(reinterpret_cast<HMODULE>(user32));
+}
+```
+
+## Common Libraries and Use Cases
+
+| Library | Load Method | Common APIs | Use Case |
+|---------|-------------|-------------|----------|
+| **ntdll.dll** | PEB | NtAllocateVirtualMemory, NtProtectVirtualMemory | Low-level system calls |
+| **kernel32.dll** | PEB | LoadLibraryA, VirtualAlloc, CreateThread | Core Windows APIs |
+| **user32.dll** | Runtime | MessageBoxA, CreateWindowEx, FindWindowA | GUI operations |
+| **advapi32.dll** | Runtime | RegOpenKeyEx, CryptAcquireContext | Registry, crypto |
+| **wininet.dll** | Runtime | InternetOpenA, HttpSendRequest | HTTP/HTTPS |
+| **ws2_32.dll** | Runtime | WSAStartup, socket, connect | Network sockets |
+| **shell32.dll** | Runtime | ShellExecuteA, SHGetFolderPath | Shell operations |
+
+## Troubleshooting
+
+### Module Not Found in PEB
+
+```cpp
+if (!(handle = resolve::module(hash))) {
+    // Module not loaded - use LoadLibrary instead
+    DBG_PRINTF("Module not in PEB, loading dynamically\n");
+}
+```
+
+### API Resolution Fails
+
+```cpp
+auto func = RESOLVE_API(module_base, FunctionName);
+if (!func) {
+    // Function doesn't exist or name is wrong
+    // Check spelling and ensure function is exported
+    DBG_PRINTF("Failed to resolve API\n");
+}
+```
+
+### LoadLibrary Returns NULL
+
+```cpp
+const auto module = kernel32.LoadLibraryA(symbol<const char*>("library.dll"));
+if (!module) {
+    // Library doesn't exist on system
+    // Check if it's a system library or architecture mismatch
+    auto error = kernel32.GetLastError();
+    DBG_PRINTF("LoadLibrary failed: %d\n", error);
+}
+```
+
+## Next Steps
+
+- Explore [Advanced Techniques](/examples/advanced-techniques)
+- Review the [API Resolution Reference](/api/resolve)
+- Learn about [Adding APIs](/guides/adding-apis)

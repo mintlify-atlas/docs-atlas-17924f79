@@ -1,0 +1,533 @@
+---
+title: Building Stardust
+description: Comprehensive guide to the build system, compiler flags, and advanced configuration
+---
+
+## Build System Overview
+
+Stardust uses a **GNU Make**-based build system that orchestrates compilation across multiple architectures and toolchains. The build process involves:
+
+1. **Assembly compilation** (NASM) for entry stubs
+2. **C++ compilation** (Clang) for main logic
+3. **Linking** with custom linker script for PIC
+4. **Section extraction** (objcopy) to produce raw shellcode
+
+## Makefile Targets
+
+### Primary Targets
+
+<CodeGroup>
+```bash Release Build
+# Build both x64 and x86 in release mode (optimized)
+make
+# Equivalent to: make release
+```
+
+```bash Debug Build
+# Build with debug symbols and DbgPrint enabled
+make debug
+```
+
+```bash Clean
+# Remove all build artifacts
+make clean
+```
+
+```bash Stomper Utility
+# Build the test harness
+make stomper
+```
+</CodeGroup>
+
+### Architecture-Specific Targets
+
+```bash
+# Build only x64
+make x64
+
+# Build only x86
+make x86
+
+# Build x64 with debug symbols
+make x64-debug
+
+# Build x86 with debug symbols
+make x86-debug
+```
+
+## Compiler Configuration
+
+### Toolchain Selection
+
+Stardust uses **Clang** with MinGW targets for cross-platform Windows compilation:
+
+```makefile Makefile
+CCX64  := clang -target x86_64-w64-mingw32
+CCX86  := clang -target i686-w64-mingw32
+ASMCC  := nasm
+```
+
+<Note>
+  Clang provides better C++20 support (particularly `consteval`) and more predictable optimization behavior compared to GCC for shellcode development.
+</Note>
+
+### Core Compiler Flags
+
+```makefile Makefile
+CFLAGS := -Os -nostdlib -fno-asynchronous-unwind-tables -std=c++20
+CFLAGS += -fno-ident -fpack-struct=8 -falign-functions=1 -s -w -mno-sse
+CFLAGS += -ffunction-sections -falign-jumps=1 -falign-labels=1
+CFLAGS += -Wl,-s,--no-seh,--enable-stdcall-fixup -masm=intel -fno-exceptions
+CFLAGS += -fms-extensions -fPIC -Iinclude -Wl,-Tscripts/linker.ld
+```
+
+#### Optimization Flags
+
+| Flag | Purpose |
+|------|----------|
+| `-Os` | Optimize for size (critical for shellcode) |
+| `-ffunction-sections` | Place each function in its own section for better dead code elimination |
+| `-falign-functions=1` | Minimize function alignment padding (save bytes) |
+| `-falign-jumps=1` | Minimize jump target alignment |
+| `-falign-labels=1` | Minimize label alignment |
+
+#### Position Independence Flags
+
+| Flag | Purpose |
+|------|----------|
+| `-fPIC` | Generate position-independent code |
+| `-nostdlib` | Don't link standard library (avoid dependencies) |
+| `-fno-asynchronous-unwind-tables` | Remove unwind tables (not needed for shellcode) |
+| `-fno-ident` | Remove compiler identification strings |
+
+#### Windows-Specific Flags
+
+| Flag | Purpose |
+|------|----------|
+| `-fms-extensions` | Enable Microsoft C extensions |
+| `-masm=intel` | Use Intel assembly syntax |
+| `-fpack-struct=8` | Pack structures to 8-byte alignment |
+| `-Wl,--enable-stdcall-fixup` | Fix stdcall symbol mangling |
+| `-Wl,--no-seh` | Disable structured exception handling |
+
+#### Security/Cleanup Flags
+
+| Flag | Purpose |
+|------|----------|
+| `-s` | Strip symbol table |
+| `-Wl,-s` | Strip symbols during linking |
+| `-w` | Suppress all warnings (for clean build output) |
+| `-mno-sse` | Disable SSE instructions (reduces complexity) |
+| `-fno-exceptions` | Disable C++ exceptions |
+
+## Build Modes
+
+### Release Mode
+
+**Command:** `make` or `make release`
+
+**Characteristics:**
+- Maximum size optimization
+- No debug symbols
+- `DBG_PRINTF` macros compile to no-ops
+- Typical output: ~750 bytes (x64), ~670 bytes (x86)
+
+**Use case:** Production payloads requiring minimal footprint
+
+```cpp include/common.h
+#if defined( DEBUG )
+#define DBG_PRINTF( format, ... ) { 
+    ntdll.DbgPrint( symbol<PCH>( "[DEBUG::%s::%d] " format ), 
+                    symbol<PCH>( __FUNCTION__ ), 
+                    __LINE__, 
+                    ##__VA_ARGS__ ); 
+}
+#else
+#define DBG_PRINTF( format, ... ) { ; }  // No-op in release
+#endif
+```
+
+### Debug Mode
+
+**Command:** `make debug`
+
+**Characteristics:**
+- Adds `-D DEBUG` preprocessor flag
+- Includes `ntdll.DbgPrint` for kernel debugging
+- Resolves `DbgPrint` API from ntdll
+- Typical output: ~1.2KB (x64), ~1.1KB (x86)
+
+**Use case:** Development, troubleshooting, and reverse engineering analysis
+
+**Viewing debug output:**
+
+<Steps>
+  <Step title="Download DebugView">
+    Get [DebugView](https://learn.microsoft.com/en-us/sysinternals/downloads/debugview) from Sysinternals.
+  </Step>
+  
+  <Step title="Run as Administrator">
+    ```powershell
+    # Right-click -> Run as administrator
+    .\Dbgview.exe
+    ```
+  </Step>
+  
+  <Step title="Enable Capture Options">
+    - Check **Capture -> Capture Kernel**
+    - Check **Capture -> Capture Win32**
+    - Uncheck **Capture -> Capture Events** (reduces noise)
+  </Step>
+  
+  <Step title="Execute Shellcode">
+    ```powershell
+    .\stomper.x64.exe stardust.x64.bin
+    ```
+    
+    Debug output will appear in DebugView in real-time.
+  </Step>
+</Steps>
+
+**Sample debug session:**
+
+```c
+[DEBUG::start::48] oh wow look we loaded user32.dll -> 00007FFB2C5A0000
+[DEBUG::start::53] running from C:\Windows\System32\svchost.exe (Pid: 4128)
+[DEBUG::start::57] shellcode @ 00007FFB2C8A6B50 [752 bytes]
+```
+
+## Linker Script
+
+The custom linker script (`scripts/linker.ld`) controls section layout to ensure proper PIC generation:
+
+```ld scripts/linker.ld
+SECTIONS
+{
+    .text :
+    {
+        *( .text$A );  /* Assembly entry stubs */
+        *( .text$B );  /* C++ compiled code */
+        *( .rdata* );  /* Read-only data (strings, constants) */
+        *( .text$C );  /* Data end marker */
+    }
+}
+```
+
+### Section Purposes
+
+<CardGroup cols={2}>
+  <Card title=".text$A" icon="arrow-right">
+    Assembly entry point with stack alignment. Contains the `stardust` symbol and `RipStart` helper.
+  </Card>
+  
+  <Card title=".text$B" icon="code">
+    All C++ compiled code marked with `declfn` attribute. This includes `instance::instance()` and `instance::start()`.
+  </Card>
+  
+  <Card title=".rdata*" icon="database">
+    Read-only data including compile-time hashes and string literals used by `symbol<T>()`.
+  </Card>
+  
+  <Card title=".text$C" icon="flag-checkered">
+    End-of-data marker provided by `RipData()`. Used for calculating shellcode size at runtime.
+  </Card>
+</CardGroup>
+
+### Custom Section Placement
+
+Code can be placed in specific sections using the `declfn` macro:
+
+```cpp include/macros.h
+#define declfn __attribute__( (section( ".text$B" )) )
+```
+
+**Usage:**
+
+```cpp src/main.cc
+// This function is placed in .text$B
+auto declfn instance::start( _In_ void* arg ) -> void {
+    // Your shellcode logic
+}
+```
+
+## Build Process Deep Dive
+
+### Step 1: Assembly Compilation
+
+```makefile Makefile
+nasm64:
+	@ $(ASMCC) -f win64 src/asm/entry.x64.asm -o bin/obj/entry.x64.obj
+	@ $(ASMCC) -f win64 src/asm/utils.x64.asm -o bin/obj/utils.x64.obj
+
+nasm86:
+	@ $(ASMCC) -f win32 src/asm/entry.x86.asm -o bin/obj/entry.x86.obj
+	@ $(ASMCC) -f win32 src/asm/utils.x86.asm -o bin/obj/utils.x86.obj
+```
+
+NASM generates object files for:
+- `entry.*.asm`: Entry point with stack alignment
+- `utils.*.asm`: Position calculation helpers (`RipStart`, `RipData`)
+
+**Key assembly features:**
+
+```asm src/asm/entry.x64.asm
+RipStart:
+    call RipPtr  ; Push return address to stack
+ret
+
+RipPtr:
+    mov rax, [rsp]  ; Get return address (our current position)
+    sub rax, 0x1b   ; Calculate shellcode base
+ret
+```
+
+### Step 2: C++ Compilation
+
+```makefile Makefile
+%.x64.obj: %.cc
+	@ echo "-> compiling $< to $(notdir $@)"
+	@ $(CCX64) -o bin/obj/$(notdir $@) -c $< $(CFLAGS)
+```
+
+Each `.cc` file is compiled to an object file with all optimization flags applied.
+
+### Step 3: Linking
+
+```makefile Makefile
+x64: nasm64 $(OBJ64)
+	@ echo "compiling x64 project"
+	@ $(CCX64) bin/obj/*.x64.obj -o bin/$(NAME).x64.exe $(CFLAGS)
+```
+
+All object files are linked together using the custom linker script. The warning:
+
+```
+/usr/bin/x86_64-w64-mingw32-ld: bin/stardust.x64.exe:.text: section below image base
+```
+
+**This warning is expected** and confirms the `.text` section is not tied to a specific base address (PIC requirement).
+
+### Step 4: Section Extraction
+
+```makefile Makefile
+@ objcopy --dump-section .text=bin/$(NAME).x64.bin bin/$(NAME).x64.exe
+@ rm bin/$(NAME).x64.exe
+```
+
+`objcopy` extracts only the `.text` section, producing a raw binary file containing pure shellcode with no PE headers or metadata.
+
+## Output Files
+
+### Directory Structure
+
+```
+bin/
+├── obj/                    # Intermediate object files
+│   ├── entry.x64.obj
+│   ├── entry.x86.obj
+│   ├── main.x64.obj
+│   ├── main.x86.obj
+│   ├── resolve.x64.obj
+│   ├── resolve.x86.obj
+│   ├── utils.x64.obj
+│   └── utils.x86.obj
+├── stardust.x64.bin        # Final x64 shellcode (752 bytes)
+└── stardust.x86.bin        # Final x86 shellcode (672 bytes)
+```
+
+### Binary Analysis
+
+**Inspect with hexdump:**
+
+```bash
+hexdump -C bin/stardust.x64.bin | head -20
+```
+
+**Expected header (x64):**
+
+```
+00000000  56 48 89 e6 48 83 e4 f0  48 83 ec 20 e8 ... |VH..H...H.. ...|
+```
+
+- `56`: `push rsi` (entry stub)
+- `48 89 e6`: `mov rsi, rsp`
+- `48 83 e4 f0`: `and rsp, 0xFFFFFFFFFFFFFFF0` (stack alignment)
+
+**Check size:**
+
+```bash
+wc -c bin/stardust.x64.bin
+```
+
+## Customizing the Build
+
+### Adding Source Files
+
+The Makefile automatically compiles all `.cc` files in `src/`:
+
+```makefile Makefile
+SRC := $(wildcard src/*.cc)
+OBJ64 := $(SRC:%.cc=%.x64.obj)
+OBJ86 := $(SRC:%.cc=%.x86.obj)
+```
+
+To add new functionality:
+
+1. Create `src/mycode.cc`
+2. Run `make` (automatically detected)
+
+### Adjusting Optimization
+
+**For smaller binaries:**
+
+```makefile
+CFLAGS := -Oz  # More aggressive size optimization (Clang only)
+```
+
+**For debugging compiler issues:**
+
+```makefile
+CFLAGS := -O0 -g  # No optimization, include debug symbols
+```
+
+### Enabling Additional Warnings
+
+```makefile
+CFLAGS += -Wall -Wextra -Wpedantic
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Error: undefined reference to 'expr::hash_string'">
+    **Cause:** The `consteval` function is not being evaluated at compile-time.
+    
+    **Solution:**
+    
+    1. Ensure you're using Clang (not GCC)
+    2. Verify C++20 is enabled: `-std=c++20`
+    3. Check that arguments to `expr::hash_string` are compile-time constants:
+    
+    ```cpp
+    // Correct: string literal is constexpr
+    auto hash = expr::hash_string( "ntdll.dll" );
+    
+    // Incorrect: runtime variable
+    const char* name = "ntdll.dll";
+    auto hash = expr::hash_string( name );  // ERROR
+    ```
+  </Accordion>
+  
+  <Accordion title="Shellcode larger than expected (>2KB)">
+    **Causes:**
+    
+    1. **Debug mode enabled**: Check if `-D DEBUG` is in CFLAGS
+    2. **Unused code not eliminated**: Ensure `-ffunction-sections` is set
+    3. **Large string literals**: Use `symbol<T>()` for all strings
+    
+    **Debug:**
+    
+    ```bash
+    # Check section sizes
+    objdump -h bin/stardust.x64.exe
+    
+    # Disassemble to find bloat
+    objdump -d -M intel bin/stardust.x64.exe | less
+    ```
+  </Accordion>
+  
+  <Accordion title="NASM error: symbol 'entry' undefined">
+    **Cause:** C++ name mangling prevents assembly from finding C++ functions.
+    
+    **Solution:**
+    
+    Ensure functions called from assembly use `extern "C"`:
+    
+    ```cpp src/main.cc
+    extern "C" auto declfn entry( _In_ void* args ) -> void {
+        stardust::instance().start( args );
+    }
+    ```
+  </Accordion>
+  
+  <Accordion title="Linker error: cannot find -lkernel32">
+    **Cause:** Makefile is trying to link Windows libraries (not needed for shellcode).
+    
+    **Solution:**
+    
+    Verify `-nostdlib` is in CFLAGS and no `-l` flags are specified:
+    
+    ```makefile
+    # Correct
+    CFLAGS := -Os -nostdlib ...
+    
+    # Incorrect
+    CFLAGS := -Os -lkernel32 -luser32  # Don't link libraries
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Advanced Techniques
+
+### Analyzing Generated Assembly
+
+Review the assembly output to verify optimization:
+
+```bash
+# Disassemble object file
+objdump -d -M intel bin/obj/main.x64.obj
+
+# Check symbol table
+nm bin/obj/main.x64.obj
+
+# View section headers
+objdump -h bin/obj/main.x64.obj
+```
+
+### Profiling Shellcode Size
+
+Track size changes across builds:
+
+```bash
+#!/bin/bash
+echo "Build,x64,x86" > sizes.csv
+for commit in $(git rev-list HEAD); do
+    git checkout $commit
+    make clean && make
+    x64=$(wc -c < bin/stardust.x64.bin)
+    x86=$(wc -c < bin/stardust.x86.bin)
+    echo "$commit,$x64,$x86" >> sizes.csv
+done
+```
+
+### Cross-Compilation from macOS
+
+Install LLVM and MinGW:
+
+```bash
+brew install llvm mingw-w64
+
+# Update Makefile paths
+CCX64 := /usr/local/opt/llvm/bin/clang -target x86_64-w64-mingw32
+CCX86 := /usr/local/opt/llvm/bin/clang -target i686-w64-mingw32
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="book" href="/api/resolve">
+    Explore available functions and macros
+  </Card>
+  
+  <Card title="Examples" icon="lightbulb" href="/examples/basic-messagebox">
+    See real-world shellcode implementations
+  </Card>
+  
+  <Card title="Advanced Topics" icon="graduation-cap" href="/examples/advanced-techniques">
+    Position calculation, string handling, and more
+  </Card>
+  
+  <Card title="Core Concepts" icon="book-open" href="/concepts/architecture">
+    Understand the Stardust architecture
+  </Card>
+</CardGroup>

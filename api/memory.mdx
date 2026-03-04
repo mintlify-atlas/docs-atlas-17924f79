@@ -1,0 +1,418 @@
+---
+title: 'memory'
+description: 'Memory manipulation utilities for position-independent shellcode'
+---
+
+The `memory` namespace provides essential memory operations optimized for shellcode environments. These functions avoid external dependencies and implement core memory operations inline for maximum portability.
+
+---
+
+## memory::zero()
+
+Securely zeros a memory region using Windows' `RtlSecureZeroMemory` to prevent compiler optimizations from removing the zeroing operation.
+
+```cpp
+inline auto zero(
+    _Inout_ void*    memory,
+    _In_    uint32_t length
+) -> void;
+```
+
+<ParamField path="memory" type="void*">
+  Pointer to the memory region to zero. The buffer will be modified in place.
+</ParamField>
+
+<ParamField path="length" type="uint32_t">
+  Number of bytes to zero, starting from the `memory` address.
+</ParamField>
+
+<ResponseField name="return" type="void">
+  No return value. The function modifies memory directly.
+</ResponseField>
+
+### Purpose
+
+Unlike standard `memset`, `RtlSecureZeroMemory` guarantees the zeroing operation will not be optimized away by the compiler, making it suitable for:
+
+- Clearing sensitive data (keys, passwords, tokens)
+- Sanitizing buffers before freeing
+- Ensuring predictable memory state
+
+### Example Usage
+
+```cpp
+// Clear a password buffer after use
+char password[64];
+// ... use password ...
+memory::zero(password, sizeof(password));
+
+// Zero a structure
+struct Credentials {
+    char username[32];
+    char password[64];
+    uint32_t session_id;
+};
+
+Credentials creds;
+// ... use credentials ...
+memory::zero(&creds, sizeof(Credentials));
+
+// Clear a dynamically-sized buffer
+void* buffer = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+// ... use buffer ...
+memory::zero(buffer, 4096);
+```
+
+### Implementation
+
+```cpp
+inline auto zero(_Inout_ void* memory, _In_ uint32_t length) -> void {
+    RtlSecureZeroMemory(memory, length);
+}
+```
+
+<Info>
+  `RtlSecureZeroMemory` is available on all Windows versions and does not require explicit linking since it's typically inlined or available via ntdll.dll.
+</Info>
+
+---
+
+## memory::copy()
+
+Copies bytes from a source buffer to a destination buffer using a simple byte-by-byte loop.
+
+```cpp
+inline auto copy(
+    _Out_ void*    destination,
+    _In_  void*    source,
+    _In_  uint32_t length
+) -> void*;
+```
+
+<ParamField path="destination" type="void*">
+  Pointer to the destination buffer where bytes will be copied. Must be at least `length` bytes in size.
+</ParamField>
+
+<ParamField path="source" type="void*">
+  Pointer to the source buffer to copy from. Must be at least `length` bytes in size.
+</ParamField>
+
+<ParamField path="length" type="uint32_t">
+  Number of bytes to copy from source to destination.
+</ParamField>
+
+<ResponseField name="return" type="void*">
+  Returns the `destination` pointer, allowing for chained operations or assignment.
+</ResponseField>
+
+### Characteristics
+
+- **No External Dependencies:** Implements copying via inline loop
+- **Forward Copy:** Copies from index 0 to `length - 1`
+- **No Overlap Safety:** Does not handle overlapping source/destination (use `memmove` if overlap is possible)
+- **Simple Implementation:** Byte-by-byte copy, not optimized for large buffers
+
+### Example Usage
+
+```cpp
+// Copy string data
+char src[] = "Hello, World!";
+char dst[32];
+memory::copy(dst, src, sizeof(src));
+
+// Copy structure
+struct Config {
+    uint32_t flags;
+    uint32_t timeout;
+};
+
+Config original = { 0x1234, 5000 };
+Config backup;
+memory::copy(&backup, &original, sizeof(Config));
+
+// Copy with assignment
+char buffer[256];
+char* result = static_cast<char*>(
+    memory::copy(buffer, "data", 5)
+);
+// result now points to buffer
+```
+
+### Implementation
+
+```cpp
+inline auto copy(_Out_ void* destination, _In_ void* source, _In_ uint32_t length) -> void* {
+    for (size_t i = 0; i < length; i++) {
+        static_cast<uint8_t*>(destination)[i] = static_cast<uint8_t*>(source)[i];
+    }
+    return destination;
+}
+```
+
+<Warning>
+  This function does NOT handle overlapping memory regions safely. If source and destination overlap, behavior is undefined. For overlapping regions, use a proper `memmove` implementation.
+</Warning>
+
+---
+
+## memory::compare()
+
+Compares two memory regions byte-by-byte and returns the difference of the first non-matching bytes.
+
+```cpp
+inline auto compare(
+    _In_ void*     memory1,
+    _In_ void*     memory2,
+    _In_ uintptr_t length
+) -> uint32_t;
+```
+
+<ParamField path="memory1" type="void*">
+  Pointer to the first memory region to compare.
+</ParamField>
+
+<ParamField path="memory2" type="void*">
+  Pointer to the second memory region to compare.
+</ParamField>
+
+<ParamField path="length" type="uintptr_t">
+  Number of bytes to compare between the two regions.
+</ParamField>
+
+<ResponseField name="return" type="uint32_t">
+  - `0` if all bytes are equal
+  - Positive value if the first differing byte in `memory1` is greater
+  - Negative value (when cast to signed) if the first differing byte in `memory1` is less
+</ResponseField>
+
+### Return Value Semantics
+
+The function returns:
+```cpp
+*a - *b  // Where a and b are the first differing bytes
+```
+
+- `compare("abc", "abc", 3) == 0`  → Equal
+- `compare("abd", "abc", 3) > 0`   → First buffer is "greater" (d > c)
+- `compare("abc", "abd", 3) < 0`   → First buffer is "less" (c < d)
+
+### Example Usage
+
+```cpp
+// String comparison
+const char* str1 = "password123";
+const char* str2 = "password123";
+
+if (memory::compare(str1, str2, 11) == 0) {
+    // Strings are equal
+}
+
+// Binary data comparison
+uint8_t hash1[32] = { /* ... */ };
+uint8_t hash2[32] = { /* ... */ };
+
+if (memory::compare(hash1, hash2, 32) == 0) {
+    // Hashes match
+}
+
+// Structure comparison
+struct Header {
+    uint32_t magic;
+    uint32_t version;
+};
+
+Header h1 = { 0x12345678, 1 };
+Header h2 = { 0x12345678, 1 };
+
+if (memory::compare(&h1, &h2, sizeof(Header)) == 0) {
+    // Headers are identical
+}
+
+// Check for specific pattern
+const char pattern[] = "MZ";  // DOS signature
+PIMAGE_DOS_HEADER dos_header = /* ... */;
+
+if (memory::compare(dos_header, pattern, 2) == 0) {
+    // Valid DOS header
+}
+```
+
+### Implementation
+
+```cpp
+inline auto compare(_In_ void* memory1, _In_ void* memory2, _In_ uintptr_t length) -> uint32_t {
+    auto a = static_cast<char*>(memory1);
+    auto b = static_cast<char*>(memory2);
+
+    do {
+        if (*a++ != *b++) {
+            return (*--a - *--b);
+        }
+    } while (--length != 0);
+
+    return 0;
+}
+```
+
+### Algorithm Details
+
+1. Cast both pointers to `char*` for byte-wise comparison
+2. Loop through each byte:
+   - Compare current bytes
+   - If different, return the difference
+   - Advance pointers
+3. If loop completes, all bytes matched → return 0
+
+<Tip>
+  For simple equality checks, test against `0`: `if (memory::compare(a, b, n) == 0)`
+</Tip>
+
+---
+
+## Use Cases in Shellcode
+
+### Clearing Sensitive Data
+
+```cpp
+auto declfn instance::start(_In_ void* arg) -> void {
+    char key[32];
+    // ... generate or receive encryption key ...
+    
+    // Use key for operations
+    // ...
+    
+    // Clear before function exit
+    memory::zero(key, sizeof(key));
+}
+```
+
+### Copying PE Headers
+
+```cpp
+// Copy DOS header for manipulation
+PIMAGE_DOS_HEADER source_dos = reinterpret_cast<PIMAGE_DOS_HEADER>(module_base);
+IMAGE_DOS_HEADER dos_copy;
+
+memory::copy(&dos_copy, source_dos, sizeof(IMAGE_DOS_HEADER));
+```
+
+### Validating Signatures
+
+```cpp
+// Validate PE signature
+const char pe_signature[] = "PE\0\0";
+PIMAGE_NT_HEADERS nt_header = /* ... */;
+
+if (memory::compare(&nt_header->Signature, pe_signature, 4) == 0) {
+    // Valid PE header
+}
+```
+
+### Duplicating Strings
+
+```cpp
+// Copy position-independent string to writable buffer
+const char* embedded_str = symbol<const char*>("config.ini");
+char filename[64];
+
+memory::copy(filename, embedded_str, 11);  // "config.ini\0" = 11 bytes
+```
+
+---
+
+## Design Philosophy
+
+### Why Custom Implementations?
+
+1. **No CRT Dependency:** Standard C library functions (memset, memcpy, memcmp) require linking against the CRT, which increases shellcode size and complexity
+
+2. **Position Independence:** These implementations are fully inline and don't rely on external symbols or import tables
+
+3. **Size Optimization:** Minimal implementation reduces compiled shellcode footprint
+
+4. **Control:** Direct control over memory operations without hidden behavior from library implementations
+
+### Inline Functions
+
+All functions use the `inline` keyword to suggest inlining at call sites:
+
+```cpp
+inline auto zero(...)    -> void;
+inline auto copy(...)    -> void*;
+inline auto compare(...) -> uint32_t;
+```
+
+This typically results in the function body being directly inserted at each call site, eliminating function call overhead.
+
+---
+
+## Performance Considerations
+
+### memory::zero()
+- Delegates to `RtlSecureZeroMemory`, which is optimized by Windows
+- May use vectorized instructions (SSE/AVX) internally on modern CPUs
+- Guaranteed to not be optimized away by compiler
+
+### memory::copy()
+- Simple byte-by-byte loop
+- Not optimized for large buffers (no vectorization)
+- Suitable for small data structures in shellcode
+- For large copies, consider using platform-specific optimized routines
+
+### memory::compare()
+- Early exit on first mismatch
+- Best case: O(1) for immediate difference
+- Worst case: O(n) for identical buffers
+- No optimization for word/dword-aligned comparisons
+
+<Note>
+  These implementations prioritize simplicity and size over raw performance. For high-performance scenarios, consider using Windows API functions like `RtlCopyMemory` or `RtlCompareMemory`.
+</Note>
+
+---
+
+## Safety Considerations
+
+<Warning>
+  None of these functions perform bounds checking or validation. Ensure:
+  - Buffers are large enough for specified lengths
+  - Pointers are valid and properly aligned
+  - For `copy()`, source and destination do not overlap
+</Warning>
+
+### Safe Usage Checklist
+
+- [ ] Verify buffer sizes before calling
+- [ ] Ensure pointers are not null
+- [ ] Check for potential buffer overruns
+- [ ] For `copy()`, validate non-overlapping regions
+- [ ] For `compare()`, ensure both buffers are at least `length` bytes
+
+---
+
+## Example: Combined Usage
+
+```cpp
+// Safe string duplication with comparison
+void secure_string_operation() {
+    // Source string
+    const char* original = symbol<const char*>("SecretData");
+    const size_t len = 11;  // "SecretData\0"
+    
+    // Allocate buffer
+    char buffer[32];
+    memory::zero(buffer, sizeof(buffer));  // Initialize to zeros
+    
+    // Copy data
+    memory::copy(buffer, original, len);
+    
+    // Verify copy
+    if (memory::compare(buffer, original, len) == 0) {
+        // Success - use buffer
+        // ...
+    }
+    
+    // Clear sensitive data before exit
+    memory::zero(buffer, sizeof(buffer));
+}
+```

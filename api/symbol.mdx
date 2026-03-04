@@ -1,0 +1,343 @@
+---
+title: 'symbol()'
+description: 'RIP-relative address resolution for position-independent data access'
+---
+
+The `symbol()` function calculates runtime addresses of data embedded in position-independent shellcode by computing offsets relative to the instruction pointer (RIP on x64, EIP on x86).
+
+## Overview
+
+In position-independent shellcode, hardcoded addresses are invalid since the code may be loaded at any memory location. The `symbol()` function solves this by:
+
+1. Getting the runtime base address via `RipData()`
+2. Computing the compile-time offset between `RipData()` and the target symbol
+3. Adjusting the runtime address by this offset
+
+This enables safe access to strings, data structures, and other embedded resources.
+
+---
+
+## Function Signature
+
+```cpp
+template <typename T>
+inline T symbol(T s);
+```
+
+<ParamField path="s" type="T">
+  Compile-time pointer or address to a symbol embedded in the shellcode (typically a string literal or global data structure).
+</ParamField>
+
+<ParamField path="T" type="template typename">
+  Type of the symbol - automatically deduced from the argument. Common types include `const char*`, `PCH` (pointer to char), or any pointer type.
+</ParamField>
+
+<ResponseField name="return" type="T">
+  Runtime-resolved pointer of the same type, adjusted for the actual load address of the shellcode.
+</ResponseField>
+
+---
+
+## Implementation
+
+```cpp
+template <typename T>
+inline T symbol(T s) {
+    return reinterpret_cast<T>(RipData()) - 
+           (reinterpret_cast<uintptr_t>(&RipData) - reinterpret_cast<uintptr_t>(s));
+}
+```
+
+### Calculation Breakdown
+
+```cpp
+// Components:
+// 1. RipData()         - Runtime address of the data section
+// 2. &RipData          - Compile-time address of RipData function
+// 3. s                 - Compile-time address of target symbol
+
+// Offset calculation:
+offset = (&RipData) - s                    // Compile-time offset
+
+// Runtime resolution:
+runtime_address = RipData() - offset        // Adjust for actual load address
+```
+
+---
+
+## Usage Examples
+
+### String Literals
+
+The most common use case is accessing string literals embedded in shellcode:
+
+```cpp
+// Instead of hardcoded string address:
+const char* message = "Hello World";  // Invalid in PIC shellcode
+
+// Use symbol() for position-independent access:
+const char* message = symbol<const char*>("Hello World");
+
+// Typical usage with Windows APIs:
+auto user32 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll"));
+msgbox(
+    nullptr,
+    symbol<const char*>("Hello world"),
+    symbol<const char*>("caption"),
+    MB_OK
+);
+```
+
+### Wide Strings
+
+```cpp
+// For Unicode strings
+const wchar_t* wide_str = symbol<const wchar_t*>(L"Wide String");
+```
+
+### Data Structures
+
+```cpp
+// Accessing embedded configuration data
+struct Config {
+    uint32_t flags;
+    uint32_t timeout;
+    char key[64];
+};
+
+static Config embedded_config = { /* ... */ };
+
+// Resolve at runtime
+Config* config = symbol<Config*>(&embedded_config);
+```
+
+---
+
+## Alternative Macro Form
+
+There's also a macro version using direct offset calculation:
+
+```cpp
+#define G_SYM(s) (uintptr_t)(RipData() - (((uintptr_t)&RipData) - ((uintptr_t)s)))
+```
+
+**Comparison:**
+
+```cpp
+// Template function (type-safe)
+auto str = symbol<const char*>("text");
+
+// Macro version (returns uintptr_t)
+auto addr = G_SYM("text");
+auto str = reinterpret_cast<const char*>(addr);
+```
+
+<Tip>
+  Prefer the template function `symbol<T>()` over the `G_SYM()` macro for type safety and cleaner syntax.
+</Tip>
+
+---
+
+## How It Works
+
+### Compile-Time Layout
+
+During compilation, symbols have fixed relative positions:
+
+```
+[.text$B section]
+  0x1000: entry()
+  0x1050: instance::start()
+  0x1100: RipData()
+  0x1110: "Hello"        <- 0x10 bytes after RipData
+  0x1120: "user32.dll"   <- 0x20 bytes after RipData
+```
+
+### Runtime Relocation
+
+When shellcode is injected at address `0x7FF0000000`:
+
+```
+[Injected memory]
+  0x7FF0001000: entry()
+  0x7FF0001050: instance::start()
+  0x7FF0001100: RipData()          <- RipData() returns 0x7FF0001100
+  0x7FF0001110: "Hello"            <- Need to resolve this
+  0x7FF0001120: "user32.dll"
+```
+
+### Resolution Process
+
+```cpp
+// Goal: Resolve "Hello" string at runtime
+auto hello_ptr = symbol<const char*>("Hello");
+
+// Step 1: Compile-time offset
+offset = 0x1100 - 0x1110 = -0x10
+
+// Step 2: Runtime adjustment
+runtime_addr = 0x7FF0001100 - (-0x10) = 0x7FF0001110  ✓
+```
+
+---
+
+## RipData() and RipStart()
+
+The `symbol()` function depends on two external assembly functions:
+
+```cpp
+extern "C" auto RipData() -> uintptr_t;   // Address of data section start
+extern "C" auto RipStart() -> uintptr_t;  // Address of code section start
+```
+
+### Implementation (Assembly)
+
+```asm
+; x64 version
+RipData:
+    call get_rip
+    ret
+
+get_rip:
+    mov rax, [rsp]
+    ret
+
+; RipStart marks the beginning of executable code
+RipStart:
+    lea rax, [rel $]
+    ret
+```
+
+<Info>
+  These functions use CPU-relative addressing to determine the current execution address, which is essential for PIC shellcode.
+</Info>
+
+---
+
+## Common Patterns
+
+### Debug Printing with symbol()
+
+```cpp
+#define DBG_PRINTF(format, ...) { \
+    ntdll.DbgPrint( \
+        symbol<PCH>("[DEBUG::%s::%d] " format), \
+        symbol<PCH>(__FUNCTION__), \
+        __LINE__, \
+        ##__VA_ARGS__ \
+    ); \
+}
+
+// Usage
+DBG_PRINTF("Loaded user32 at %p\n", user32_base);
+```
+
+### Dynamic Library Loading
+
+```cpp
+auto declfn instance::start(_In_ void* arg) -> void {
+    // Load library using position-independent string
+    const auto user32 = kernel32.LoadLibraryA(
+        symbol<const char*>("user32.dll")
+    );
+    
+    if (user32) {
+        DBG_PRINTF("Loaded user32 -> %p\n", user32);
+    }
+}
+```
+
+### Batch String Resolution
+
+```cpp
+struct Strings {
+    const char* kernel32 = symbol<const char*>("kernel32.dll");
+    const char* ntdll    = symbol<const char*>("ntdll.dll");
+    const char* user32   = symbol<const char*>("user32.dll");
+} strings;
+```
+
+---
+
+## Type Safety
+
+The template design provides compile-time type checking:
+
+```cpp
+// Correct usage
+const char* str = symbol<const char*>("text");
+
+// Compiler error - type mismatch
+const int* ptr = symbol<const char*>("text");  // Error!
+
+// Explicit cast required if changing types
+auto addr = symbol<uintptr_t>(reinterpret_cast<uintptr_t>("text"));
+```
+
+---
+
+## Performance Considerations
+
+- **Inline Function:** No function call overhead
+- **Simple Arithmetic:** Only subtraction operations
+- **Compile-Time Optimization:** Compilers often optimize the offset calculation
+- **No Memory Allocation:** Direct pointer arithmetic
+
+<Tip>
+  For frequently accessed symbols, consider caching the resolved pointer in a local variable instead of calling `symbol()` repeatedly.
+</Tip>
+
+---
+
+## Limitations
+
+<Warning>
+  - Only works for symbols embedded within the shellcode's memory region
+  - Cannot resolve external DLL addresses (use `resolve::api()` instead)
+  - Assumes contiguous memory layout between code and data sections
+</Warning>
+
+### What symbol() Does NOT Do
+
+- Resolve Windows API addresses (use `resolve::api()`)
+- Handle dynamically allocated memory
+- Work with addresses from other modules
+- Perform validation or bounds checking
+
+---
+
+## Example: Complete Shellcode Usage
+
+```cpp
+extern "C" auto declfn entry(_In_ void* args) -> void {
+    stardust::instance().start(args);
+}
+
+auto declfn instance::start(_In_ void* arg) -> void {
+    // Load additional module
+    const auto user32 = kernel32.LoadLibraryA(
+        symbol<const char*>("user32.dll")
+    );
+    
+    // Resolve MessageBoxA
+    decltype(MessageBoxA)* msgbox = RESOLVE_API(
+        reinterpret_cast<uintptr_t>(user32),
+        MessageBoxA
+    );
+    
+    // Display message with position-independent strings
+    msgbox(
+        nullptr,
+        symbol<const char*>("Hello from shellcode!"),
+        symbol<const char*>("Stardust"),
+        MB_OK | MB_ICONINFORMATION
+    );
+    
+    // Debug output
+    DBG_PRINTF(
+        "Running from %ls (PID: %d)\n",
+        NtCurrentPeb()->ProcessParameters->ImagePathName.Buffer,
+        NtCurrentTeb()->ClientId.UniqueProcess
+    );
+}
+```

@@ -1,0 +1,219 @@
+---
+title: 'Basic MessageBox Example'
+description: 'Walk through the default MessageBox implementation in Stardust'
+icon: 'message'
+---
+
+## Overview
+
+The default Stardust implementation demonstrates the fundamental concepts of position-independent shellcode by displaying a MessageBox. This example covers module resolution from the PEB, dynamic library loading, API resolution, and working with raw strings.
+
+## Source Code Walkthrough
+
+Let's examine the default implementation in `src/main.cc`:
+
+### Entry Point and Initialization
+
+```cpp src/main.cc
+extern "C" auto declfn entry(
+    _In_ void* args
+) -> void {
+    stardust::instance()
+        .start( args );
+}
+```
+
+The `entry` function is the shellcode entry point. It creates a `stardust::instance` object and calls its `start` method. The `declfn` attribute ensures the function is placed in the `.text$B` section for proper position-independent execution.
+
+### Constructor: Resolving Modules
+
+```cpp src/main.cc
+declfn instance::instance(
+    void
+) {
+    // Calculate the shellcode base address + size
+    base.address = RipStart();
+    base.length  = ( RipData() - base.address ) + END_OFFSET;
+
+    // Load the modules from PEB or any other desired way
+    if ( ! (( ntdll.handle = resolve::module( expr::hash_string<wchar_t>( L"ntdll.dll" ) ) )) ) {
+        return;
+    }
+
+    if ( ! (( kernel32.handle = resolve::module( expr::hash_string<wchar_t>( L"kernel32.dll" ) ) )) ) {
+        return;
+    }
+
+    // Let the macro handle the resolving part automatically
+    RESOLVE_IMPORT( ntdll );
+    RESOLVE_IMPORT( kernel32 );
+}
+```
+
+**Key Concepts:**
+
+1. **Base Address Calculation**: `RipStart()` and `RipData()` are assembly functions that return instruction pointer-relative addresses, allowing the shellcode to determine its location in memory.
+
+2. **Module Resolution**: `resolve::module()` walks the PEB's `InLoadOrderModuleList` to find loaded modules by hash:
+   - Uses FNV-1a hashing at compile time via `expr::hash_string`
+   - Returns the base address of the module
+   - Case-insensitive matching
+
+3. **API Resolution**: `RESOLVE_IMPORT()` macro automatically resolves all API pointers defined in the module struct by:
+   - Iterating through struct members
+   - Calling `resolve::_api()` for each function hash
+   - Storing the resolved addresses back into the struct
+
+### The Main Logic
+
+```cpp src/main.cc
+auto declfn instance::start(
+    _In_ void* arg
+) -> void {
+    const auto user32 = kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+
+    if ( user32 ) {
+        DBG_PRINTF( "oh wow look we loaded user32.dll -> %p\n", user32 );
+    } else {
+        DBG_PRINTF( "okay something went wrong. failed to load user32 :/\n" );
+    }
+
+    DBG_PRINTF( "running from %ls (Pid: %d)\n",
+        NtCurrentPeb()->ProcessParameters->ImagePathName.Buffer,
+        NtCurrentTeb()->ClientId.UniqueProcess );
+
+    DBG_PRINTF( "shellcode @ %p [%d bytes]\n", base.address, base.length );
+
+    decltype( MessageBoxA ) * msgbox = RESOLVE_API( reinterpret_cast<uintptr_t>( user32 ), MessageBoxA );
+
+    msgbox( nullptr, symbol<const char*>( "Hello world" ), symbol<const char*>( "caption" ), MB_OK );
+}
+```
+
+## Understanding Key Components
+
+### The symbol() Function
+
+The `symbol()` function converts hardcoded strings to position-independent addresses:
+
+```cpp include/common.h
+template <typename T>
+inline T symbol(T s) {
+    return reinterpret_cast<T>(RipData()) - (reinterpret_cast<uintptr_t>(&RipData) - reinterpret_cast<uintptr_t>(s));
+}
+```
+
+**Usage:**
+- `symbol<const char*>("user32.dll")` - Returns the runtime address of the string
+- Works by calculating the offset from a known position (RipData) to the string
+- Essential for accessing any hardcoded data in position-independent shellcode
+
+### The RESOLVE_API Macro
+
+```cpp include/resolve.h
+#define RESOLVE_API( m, s ) resolve::api<decltype(s)>( m, expr::hash_string( # s ) )
+```
+
+**How it works:**
+1. Takes a module base address `m` and function name `s`
+2. Hashes the function name at compile time using `expr::hash_string`
+3. Resolves the function address by:
+   - Parsing the module's PE export directory
+   - Iterating through exported function names
+   - Matching against the hash
+   - Returning the function address
+4. Casts the result to the correct function pointer type using `decltype`
+
+### Debug Output
+
+```cpp include/common.h
+#if defined( DEBUG )
+#define DBG_PRINTF( format, ... ) { ntdll.DbgPrint( symbol<PCH>( "[DEBUG::%s::%d] " format ), symbol<PCH>( __FUNCTION__ ), __LINE__, ##__VA_ARGS__ ); }
+#else
+#define DBG_PRINTF( format, ... ) { ; }
+#endif
+```
+
+**Features:**
+- Only active when compiled with `make debug`
+- Uses `ntdll.DbgPrint` for kernel-level debug output
+- Automatically includes function name and line number
+- All strings passed through `symbol()` for position independence
+- View output with DebugView or kernel debugger
+
+## Complete Example
+
+Here's a minimal complete example:
+
+```cpp
+#include <common.h>
+#include <constexpr.h>
+#include <resolve.h>
+
+using namespace stardust;
+
+extern "C" auto declfn entry(_In_ void* args) -> void {
+    stardust::instance().start(args);
+}
+
+declfn instance::instance(void) {
+    base.address = RipStart();
+    base.length = (RipData() - base.address) + END_OFFSET;
+
+    // Resolve kernel32 from PEB
+    if (!(kernel32.handle = resolve::module(expr::hash_string<wchar_t>(L"kernel32.dll")))) {
+        return;
+    }
+
+    // Resolve all APIs in kernel32 struct
+    RESOLVE_IMPORT(kernel32);
+}
+
+auto declfn instance::start(_In_ void* arg) -> void {
+    // Load user32.dll at runtime
+    const auto user32 = kernel32.LoadLibraryA(symbol<const char*>("user32.dll"));
+    
+    if (!user32) {
+        return; // Failed to load user32
+    }
+
+    // Resolve MessageBoxA from user32
+    auto msgbox = RESOLVE_API(reinterpret_cast<uintptr_t>(user32), MessageBoxA);
+
+    // Display the message box
+    msgbox(nullptr, 
+           symbol<const char*>("Hello from Stardust!"), 
+           symbol<const char*>("Stardust Shellcode"), 
+           MB_OK | MB_ICONINFORMATION);
+}
+```
+
+## Building and Testing
+
+Build in release mode:
+```bash
+make
+```
+
+Build with debug output:
+```bash
+make debug
+```
+
+The compiled shellcode will be in:
+- `bin/stardust.x64.bin` - 64-bit shellcode
+- `bin/stardust.x86.bin` - 32-bit shellcode
+
+## Key Takeaways
+
+1. **Module Resolution**: Always resolve from PEB before using APIs
+2. **String Handling**: Use `symbol<>()` for all hardcoded strings
+3. **API Resolution**: Use `RESOLVE_API()` macro for type-safe resolution
+4. **Error Checking**: Always validate module and API resolution results
+5. **Position Independence**: All addresses must be calculated at runtime
+
+## Next Steps
+
+- Learn about [Loading Additional Libraries](/examples/loading-libraries)
+- Explore [Advanced Techniques](/examples/advanced-techniques)
+- Review the [API Reference](/api/resolve)

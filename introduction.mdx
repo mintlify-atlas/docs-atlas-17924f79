@@ -1,0 +1,183 @@
+---
+title: Introduction
+description: Modern position-independent shellcode template framework for Windows security research
+---
+
+## What is Stardust?
+
+Stardust is a modern and easy-to-use 32/64-bit **position-independent shellcode template framework** for Windows. It provides a robust foundation for developing advanced shellcode with modern C++ features, eliminating the complexity of manual assembly while maintaining full control over code generation.
+
+Built with security researchers and red team operators in mind, Stardust bridges the gap between high-level development convenience and low-level shellcode requirements.
+
+## Key Features
+
+### Position Independent Code (PIC)
+Stardust generates fully position-independent shellcode that can execute from any memory location without relocation. The framework handles all address calculations transparently through custom linker scripts and runtime resolution.
+
+```cpp src/main.cc
+// Shellcode automatically calculates its own base address
+base.address = RipStart();
+base.length  = ( RipData() - base.address ) + END_OFFSET;
+```
+
+### Compile-Time Hashing with FNV-1a
+All API and module names are hashed at compile-time using the FNV-1a algorithm, eliminating plaintext strings from the final binary. This provides operational security while maintaining clean, readable source code.
+
+```cpp
+// Strings are hashed at compile-time - no runtime overhead
+auto ntdll_hash = expr::hash_string<wchar_t>( L"ntdll.dll" );
+auto loadlib_hash = expr::hash_string<char>( "LoadLibraryA" );
+```
+
+### Dynamic API Resolution
+Stardust resolves Windows API functions at runtime by walking the Process Environment Block (PEB) and parsing module export tables. This avoids Import Address Table (IAT) dependencies.
+
+```cpp include/resolve.h
+namespace resolve {
+    auto module( const uint32_t library_hash ) -> uintptr_t;
+    
+    template <typename T>
+    inline auto api( const uintptr_t module_base, 
+                     const uintptr_t symbol_hash ) -> T*;
+}
+```
+
+### C++20 Modern Features
+- **Consteval functions**: `expr::hash_string` performs hashing at compile-time
+- **Template metaprogramming**: Type-safe API resolution with automatic casting
+- **Raw string support**: The `symbol<T>()` function handles string literals in PIC context
+- **Structured design**: Clean class-based architecture with the `instance` pattern
+
+```cpp src/main.cc
+// C++20 consteval ensures compile-time evaluation
+if ( ! (( ntdll.handle = resolve::module( 
+    expr::hash_string<wchar_t>( L"ntdll.dll" ) ) )) ) {
+    return;
+}
+```
+
+### Debug Capabilities
+When compiled in debug mode, Stardust provides `DbgPrint` integration for kernel-level debugging through DebugView.
+
+```cpp
+// Debug output via DbgPrint (debug builds only)
+DBG_PRINTF( "running from %ls (Pid: %d)\n",
+    NtCurrentPeb()->ProcessParameters->ImagePathName.Buffer,
+    NtCurrentTeb()->ClientId.UniqueProcess );
+
+DBG_PRINTF( "shellcode @ %p [%d bytes]\n", base.address, base.length );
+```
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Security Research" icon="microscope">
+    Study Windows internals, PEB/TEB structures, and module loading behavior in controlled environments.
+  </Card>
+  
+  <Card title="Red Team Operations" icon="shield-halved">
+    Develop custom post-exploitation payloads with minimal footprint and evasion-friendly characteristics.
+  </Card>
+  
+  <Card title="Exploit Development" icon="bug">
+    Create reliable position-independent payloads for memory corruption vulnerabilities.
+  </Card>
+  
+  <Card title="Malware Analysis" icon="magnifying-glass">
+    Understand shellcode patterns and techniques used in modern offensive tooling.
+  </Card>
+</CardGroup>
+
+<Warning>
+  Stardust is designed for **authorized security research and testing only**. Users are responsible for ensuring compliance with all applicable laws and regulations.
+</Warning>
+
+## Architecture Overview
+
+Stardust's architecture consists of several key components:
+
+### 1. Entry Point (ASM)
+Native assembly stubs (`entry.x64.asm`, `entry.x86.asm`) handle stack alignment and initial execution flow before transferring control to C++ code.
+
+```asm src/asm/entry.x64.asm
+stardust:
+    push  rsi
+    mov   rsi, rsp
+    and   rsp, 0FFFFFFFFFFFFFFF0h  ; Align stack to 16 bytes
+    sub   rsp, 020h
+    call  entry                    ; Jump to C++ entry point
+    mov   rsp, rsi
+    pop   rsi
+ret
+```
+
+### 2. Instance Initialization
+The `instance` class constructor resolves critical modules (ntdll.dll, kernel32.dll) and their exported functions using compile-time hashes.
+
+### 3. Runtime Resolution
+The `resolve::module()` and `resolve::api()` functions parse in-memory structures to locate modules and functions without using the IAT.
+
+### 4. Payload Execution
+The `instance::start()` method contains your custom shellcode logic, with full access to resolved Windows APIs.
+
+### 5. Linker Script Magic
+Custom linker script (`scripts/linker.ld`) ensures proper section ordering for position independence:
+
+```ld scripts/linker.ld
+SECTIONS
+{
+    .text :
+    {
+        *( .text$A );  /* Entry stub */
+        *( .text$B );  /* Main code */
+        *( .rdata* );  /* Read-only data */
+        *( .text$C );  /* Data marker */
+    }
+}
+```
+
+## Project Structure
+
+```
+stardust/
+├── include/
+│   ├── common.h      # Main instance class and core definitions
+│   ├── constexpr.h   # Compile-time hashing functions
+│   ├── macros.h      # Helper macros (D_API, RESOLVE_IMPORT)
+│   ├── memory.h      # Memory manipulation utilities
+│   ├── native.h      # Windows native structures (PEB, TEB)
+│   └── resolve.h     # API/module resolution interfaces
+├── src/
+│   ├── asm/
+│   │   ├── entry.x64.asm  # 64-bit entry point
+│   │   ├── entry.x86.asm  # 32-bit entry point
+│   │   ├── utils.x64.asm  # 64-bit utilities (RipData)
+│   │   └── utils.x86.asm  # 32-bit utilities
+│   ├── main.cc       # Shellcode entry and initialization
+│   └── resolve.cc    # Runtime resolution implementation
+├── scripts/
+│   └── linker.ld     # Custom linker script
+├── test/
+│   └── stomper.cc    # Test harness for executing shellcode
+└── Makefile          # Build system
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get Stardust running in under 5 minutes
+  </Card>
+  
+  <Card title="Building" icon="hammer" href="/building">
+    Learn about build modes and compiler options
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api/resolve">
+    Explore the complete API documentation
+  </Card>
+  
+  <Card title="Examples" icon="book" href="/examples/basic-messagebox">
+    See real-world shellcode implementations
+  </Card>
+</CardGroup>

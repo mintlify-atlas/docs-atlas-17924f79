@@ -1,0 +1,412 @@
+---
+title: Creating Custom Shellcode
+description: Learn how to create custom shellcode with Stardust
+---
+
+Stardust makes it easy to create custom position-independent shellcode for Windows. This guide walks you through modifying the `start()` method and building your shellcode.
+
+## Overview
+
+Creating custom shellcode involves:
+
+1. Modifying the `start()` method in `src/main.cc`
+2. Using the `symbol()` function for raw strings
+3. Calling resolved Windows APIs
+4. Building and testing your changes
+
+## The Entry Point
+
+The main shellcode logic lives in the `start()` method of the `instance` class:
+
+```cpp src/main.cc
+auto declfn instance::start(
+    _In_ void* arg
+) -> void {
+    // Your shellcode logic goes here
+}
+```
+
+This method is called automatically after the constructor resolves all APIs.
+
+## Using Raw Strings
+
+### The symbol() Function
+
+Stardust provides the `symbol()` template function for handling raw strings in position-independent code:
+
+```cpp include/common.h
+template <typename T>
+inline T symbol(T s) {
+    return reinterpret_cast<T>(RipData()) - (reinterpret_cast<uintptr_t>(&RipData) - reinterpret_cast<uintptr_t>(s));
+}
+```
+
+This function calculates the runtime address of strings relative to the shellcode's position.
+
+### Using Strings
+
+Always wrap string literals with `symbol()`:
+
+```cpp
+// Correct
+kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+
+// Wrong - will not work in position-independent code
+kernel32.LoadLibraryA( "user32.dll" );
+```
+
+The `symbol()` function works with both narrow and wide strings:
+
+```cpp
+// Narrow strings
+auto msg = symbol<const char*>( "Hello world" );
+
+// Wide strings
+auto wstr = symbol<const wchar_t*>( L"Wide string" );
+```
+
+## Calling Windows APIs
+
+### Pre-Resolved APIs
+
+APIs defined in the instance struct can be called directly:
+
+```cpp
+// These are resolved in the constructor
+kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+kernel32.GetProcAddress( handle, symbol<const char*>( "MessageBoxA" ) );
+```
+
+### Runtime API Resolution
+
+For APIs not in the instance struct, use `RESOLVE_API`:
+
+```cpp src/main.cc
+// Load the module
+const auto user32 = kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+
+// Resolve the API
+decltype( MessageBoxA ) * msgbox = RESOLVE_API( reinterpret_cast<uintptr_t>( user32 ), MessageBoxA );
+
+// Call the API
+msgbox( nullptr, symbol<const char*>( "Hello world" ), symbol<const char*>( "caption" ), MB_OK );
+```
+
+### The RESOLVE_API Macro
+
+`RESOLVE_API` is a wrapper that handles hashing and type casting:
+
+```cpp include/resolve.h
+#define RESOLVE_API( m, s ) resolve::api<decltype(s)>( m, expr::hash_string( # s ) )
+```
+
+This macro:
+1. Hashes the function name at compile time
+2. Calls `resolve::api()` to find the function
+3. Casts the result to the correct function pointer type
+
+## Example Shellcode
+
+### Simple MessageBox
+
+```cpp src/main.cc
+auto declfn instance::start(
+    _In_ void* arg
+) -> void {
+    const auto user32 = kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+    
+    if ( !user32 ) {
+        return;
+    }
+    
+    decltype( MessageBoxA ) * msgbox = RESOLVE_API( 
+        reinterpret_cast<uintptr_t>( user32 ), 
+        MessageBoxA 
+    );
+    
+    msgbox( 
+        nullptr, 
+        symbol<const char*>( "Hello from Stardust!" ), 
+        symbol<const char*>( "Shellcode" ), 
+        MB_OK | MB_ICONINFORMATION
+    );
+}
+```
+
+### Getting Process Information
+
+Access PEB and TEB structures:
+
+```cpp
+auto declfn instance::start(
+    _In_ void* arg
+) -> void {
+    DBG_PRINTF( "Running from %ls (Pid: %d)\n",
+        NtCurrentPeb()->ProcessParameters->ImagePathName.Buffer,
+        NtCurrentTeb()->ClientId.UniqueProcess );
+    
+    DBG_PRINTF( "Shellcode @ %p [%d bytes]\n", base.address, base.length );
+}
+```
+
+These macros are defined in `include/native.h`:
+
+```cpp
+#define NtCurrentPeb() (NtCurrentTeb()->ProcessEnvironmentBlock)
+#define NtCurrentTeb() ((PTEB)__readgsqword(0x30))  // x64
+// or
+#define NtCurrentTeb() ((PTEB)__readfsdword(0x18))  // x86
+```
+
+### Loading and Calling Multiple APIs
+
+```cpp
+auto declfn instance::start(
+    _In_ void* arg
+) -> void {
+    // Load module
+    const auto user32 = kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+    if ( !user32 ) return;
+    
+    // Resolve multiple APIs
+    auto msgbox = RESOLVE_API( reinterpret_cast<uintptr_t>( user32 ), MessageBoxA );
+    auto getDC = RESOLVE_API( reinterpret_cast<uintptr_t>( user32 ), GetDC );
+    auto releaseDC = RESOLVE_API( reinterpret_cast<uintptr_t>( user32 ), ReleaseDC );
+    
+    // Use the APIs
+    HDC hdc = getDC( nullptr );
+    if ( hdc ) {
+        // Do something with DC
+        releaseDC( nullptr, hdc );
+    }
+    
+    msgbox( nullptr, 
+        symbol<const char*>( "Done!" ), 
+        symbol<const char*>( "Success" ), 
+        MB_OK );
+}
+```
+
+## Building Your Shellcode
+
+### Release Build
+
+Build optimized shellcode without debug symbols:
+
+```bash
+make
+```
+
+This produces:
+- `bin/stardust.x64.bin` - 64-bit shellcode
+- `bin/stardust.x86.bin` - 32-bit shellcode
+
+Example output:
+```
+-> compiling src/main.cc to main.x64.obj
+-> compiling src/resolve.cc to resolve.x64.obj
+compiling x64 project
+/usr/bin/x86_64-w64-mingw32-ld: bin/stardust.x64.exe:.text: section below image base
+-> compiling src/main.cc to main.x86.obj
+-> compiling src/resolve.cc to resolve.x86.obj
+compiling x86 project
+/usr/bin/i686-w64-mingw32-ld: bin/stardust.x86.exe:.text: section below image base
+```
+
+### Debug Build
+
+Build with debug output enabled:
+
+```bash
+make debug
+```
+
+This enables:
+- `DBG_PRINTF` macro output
+- `ntdll.DbgPrint` API resolution
+- Larger binary size due to debug strings
+
+See [Debugging Guide](/guides/debugging) for more details.
+
+### Build Flags
+
+The Makefile uses these optimization flags:
+
+```makefile
+CFLAGS := -Os -nostdlib -fno-asynchronous-unwind-tables -std=c++20
+CFLAGS += -fno-ident -fpack-struct=8 -falign-functions=1 -s -w -mno-sse
+CFLAGS += -ffunction-sections -falign-jumps=1 -falign-labels=1
+CFLAGS += -Wl,-s,--no-seh,--enable-stdcall-fixup -masm=intel -fno-exceptions
+CFLAGS += -fms-extensions -fPIC -Iinclude -Wl,-Tscripts/linker.ld
+```
+
+Key flags:
+- `-Os`: Optimize for size
+- `-nostdlib`: No standard library
+- `-fPIC`: Position independent code
+- `-fno-exceptions`: No C++ exceptions
+
+## Testing Your Shellcode
+
+### Using the Stomper Loader
+
+Stardust includes a test loader that uses module stomping:
+
+```bash
+# Build the stomper
+make stomper
+
+# Run your shellcode
+test/stomper.x64.exe bin/stardust.x64.bin
+```
+
+See [Module Stomping Guide](/guides/module-stomping) for details.
+
+### Direct Execution
+
+You can also execute shellcode directly:
+
+```cpp
+#include <windows.h>
+#include <stdio.h>
+
+typedef void (*ShellcodeEntry)(void*);
+
+int main() {
+    // Read shellcode from file
+    HANDLE hFile = CreateFileA("stardust.x64.bin", GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    DWORD size = GetFileSize(hFile, NULL);
+    LPVOID shellcode = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    
+    ReadFile(hFile, shellcode, size, NULL, NULL);
+    CloseHandle(hFile);
+    
+    // Execute
+    ShellcodeEntry entry = (ShellcodeEntry)shellcode;
+    entry(NULL);
+    
+    VirtualFree(shellcode, 0, MEM_RELEASE);
+    return 0;
+}
+```
+
+## Common Patterns
+
+### Checking Shellcode Information
+
+Access shellcode metadata from the `base` struct:
+
+```cpp
+DBG_PRINTF( "Shellcode @ %p [%d bytes]\n", base.address, base.length );
+```
+
+The `base` struct is populated in the constructor:
+
+```cpp src/main.cc
+declfn instance::instance(void) {
+    // Calculate the shellcode base address + size
+    base.address = RipStart();
+    base.length  = ( RipData() - base.address ) + END_OFFSET;
+    // ...
+}
+```
+
+### Conditional Compilation
+
+Use preprocessor directives for debug-only code:
+
+```cpp
+#ifdef DEBUG
+    DBG_PRINTF( "Debug info: %p\n", ptr );
+#endif
+```
+
+### Error Handling
+
+Always validate API calls:
+
+```cpp
+const auto hModule = kernel32.LoadLibraryA( symbol<const char*>( "advapi32.dll" ) );
+if ( !hModule ) {
+    DBG_PRINTF( "Failed to load advapi32.dll\n" );
+    return;
+}
+
+auto regOpenKey = RESOLVE_API( reinterpret_cast<uintptr_t>( hModule ), RegOpenKeyA );
+if ( !regOpenKey ) {
+    DBG_PRINTF( "Failed to resolve RegOpenKeyA\n" );
+    return;
+}
+```
+
+## Best Practices
+
+### 1. Always Use symbol() for Strings
+
+Never use raw string literals:
+
+```cpp
+// Good
+auto str = symbol<const char*>( "hello" );
+
+// Bad - will crash
+auto str = "hello";
+```
+
+### 2. Check Return Values
+
+Validate all API calls:
+
+```cpp
+if ( !kernel32.LoadLibraryA( ... ) ) {
+    // Handle error
+    return;
+}
+```
+
+### 3. Keep It Small
+
+Minimize shellcode size:
+- Only resolve APIs you need
+- Avoid large data structures
+- Use compile-time computation
+
+### 4. Test Both Architectures
+
+Build and test both x86 and x64:
+
+```bash
+make
+test/stomper.x64.exe bin/stardust.x64.bin
+test/stomper.x86.exe bin/stardust.x86.bin
+```
+
+## Troubleshooting
+
+### Shellcode Crashes
+
+1. Ensure all strings use `symbol()`
+2. Check API resolution succeeded
+3. Validate module handles
+4. Enable debug build: `make debug`
+
+### Position Independence Issues
+
+If shellcode works in one location but not another:
+- Global variables may not be position-independent
+- Check for hardcoded addresses
+- Verify all data uses `symbol()` or relative addressing
+
+### Size Issues
+
+If shellcode is too large:
+- Build release mode: `make` (not `make debug`)
+- Remove unused APIs from instance struct
+- Minimize string usage
+- Check compiler flags
+
+## Next Steps
+
+- [Adding New APIs](/guides/adding-apis)
+- [Module Stomping](/guides/module-stomping)
+- [Debugging](/guides/debugging)

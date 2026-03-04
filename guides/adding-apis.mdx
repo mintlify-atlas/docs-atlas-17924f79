@@ -1,0 +1,218 @@
+---
+title: Adding New APIs
+description: Learn how to add new Windows APIs to your Stardust shellcode
+---
+
+Stardust provides a clean and structured way to add new Windows APIs to your shellcode. This guide walks you through the process of adding APIs from any Windows module.
+
+## Overview
+
+Adding new APIs involves four main steps:
+
+1. Add the API to the instance struct in `include/common.h`
+2. Use the `D_API` macro to declare the API
+3. Resolve the module base in the constructor
+4. Use the `RESOLVE_IMPORT` macro to resolve all APIs
+
+## Step-by-Step Guide
+
+### 1. Add to Instance Struct
+
+First, edit `include/common.h` and add a new struct for your module inside the `instance` class. For example, to add `user32.dll` with `MessageBoxA`:
+
+```cpp include/common.h
+class instance {
+    // ... existing code ...
+    
+    struct {
+        uintptr_t handle; // base address to user32.dll
+
+        struct {
+            D_API( MessageBoxA );
+            // more entries can be added here
+        };
+    } user32 = {
+        RESOLVE_TYPE( MessageBoxA ),
+        // more entries can be added here 
+    };
+    
+    // ... rest of the class ...
+}
+```
+
+### 2. Understanding the Macros
+
+Stardust uses several macros to simplify API resolution:
+
+#### D_API Macro
+
+The `D_API` macro declares a function pointer:
+
+```cpp include/macros.h
+#define D_API( x )  decltype( x ) * x;
+```
+
+This creates a typed function pointer that matches the Windows API signature.
+
+#### RESOLVE_TYPE Macro
+
+The `RESOLVE_TYPE` macro stores the compile-time hash of the function name:
+
+```cpp include/resolve.h
+#define RESOLVE_TYPE( s )   .s = reinterpret_cast<decltype(s)*>( expr::hash_string( # s ) )
+```
+
+This uses FNV1a hashing to convert the function name to a hash at compile time.
+
+### 3. Resolve Module Base
+
+In `src/main.cc`, update the `instance::instance()` constructor to resolve your module:
+
+```cpp src/main.cc
+declfn instance::instance(void) {
+    // ... existing code ...
+    
+    // Resolve user32.dll from PEB if loaded
+    if ( ! (( user32.handle = resolve::module( expr::hash_string<wchar_t>( L"user32.dll" ) ) )) ) {
+        return;
+    }
+
+    // Automatically resolve every entry imported by user32
+    RESOLVE_IMPORT( user32 );
+    
+    // ... rest of constructor ...
+}
+```
+
+### 4. Understanding RESOLVE_IMPORT
+
+The `RESOLVE_IMPORT` macro automatically resolves all APIs in a module struct:
+
+```cpp include/macros.h
+#define RESOLVE_IMPORT( m ) { \
+    for ( int i = 1; i < expr::struct_count<decltype( instance::m )>(); i++ ) { \
+        reinterpret_cast<uintptr_t*>( &m )[ i ] = resolve::_api( m.handle, reinterpret_cast<uintptr_t*>( &m )[ i ] ); \
+    } \
+}
+```
+
+This macro:
+- Iterates through all members of the struct
+- Takes the stored hash value
+- Calls `resolve::_api()` to find the function address
+- Replaces the hash with the actual function pointer
+
+## Complete Example: Adding MessageBoxA
+
+Here's a complete example showing how `user32.MessageBoxA` is added:
+
+### common.h (lines 40-79)
+
+```cpp
+struct {
+    uintptr_t handle;
+
+    struct {
+        D_API( MessageBoxA );
+    };
+} user32 = {
+    RESOLVE_TYPE( MessageBoxA )
+};
+```
+
+### main.cc Constructor (lines 26-39)
+
+```cpp
+if ( ! (( user32.handle = resolve::module( expr::hash_string<wchar_t>( L"user32.dll" ) ) )) ) {
+    return;
+}
+
+RESOLVE_IMPORT( user32 );
+```
+
+### Using the API (lines 59-61)
+
+```cpp
+decltype( MessageBoxA ) * msgbox = RESOLVE_API( reinterpret_cast<uintptr_t>( user32 ), MessageBoxA );
+
+msgbox( nullptr, symbol<const char*>( "Hello world" ), symbol<const char*>( "caption" ), MB_OK );
+```
+
+## Loading Modules at Runtime
+
+If a module isn't loaded in the PEB, you can load it dynamically:
+
+```cpp
+const auto user32 = kernel32.LoadLibraryA( symbol<const char*>( "user32.dll" ) );
+
+if ( user32 ) {
+    DBG_PRINTF( "Loaded user32.dll -> %p\n", user32 );
+} else {
+    DBG_PRINTF( "Failed to load user32\n" );
+}
+```
+
+## Best Practices
+
+### Multiple APIs from Same Module
+
+You can add multiple APIs from the same module:
+
+```cpp
+struct {
+    uintptr_t handle;
+
+    struct {
+        D_API( MessageBoxA );
+        D_API( CreateWindowExA );
+        D_API( GetDC );
+    };
+} user32 = {
+    RESOLVE_TYPE( MessageBoxA ),
+    RESOLVE_TYPE( CreateWindowExA ),
+    RESOLVE_TYPE( GetDC )
+};
+```
+
+### Error Handling
+
+Always check if module resolution succeeded:
+
+```cpp
+if ( ! (( user32.handle = resolve::module( expr::hash_string<wchar_t>( L"user32.dll" ) ) )) ) {
+    // Module not found in PEB
+    return;
+}
+```
+
+### Compile-Time Hashing
+
+All string hashing happens at compile time using `expr::hash_string`, which means:
+- No function names in the final shellcode
+- Smaller binary size
+- Better evasion characteristics
+
+## Troubleshooting
+
+### API Not Resolving
+
+If your API isn't resolving:
+
+1. Verify the module is loaded: Check with `resolve::module()`
+2. Check API name spelling: Must match exactly
+3. Ensure API is exported: Use `dumpbin /exports` on the DLL
+4. Debug with `DBG_PRINTF`: See [Debugging Guide](/guides/debugging)
+
+### Compilation Errors
+
+Common compilation errors:
+
+- **"undeclared identifier"**: Add Windows headers or forward declare
+- **"conflicting types"**: Check function signature matches Windows API
+- **"struct count mismatch"**: Ensure `RESOLVE_TYPE` count matches `D_API` count
+
+## Next Steps
+
+- [Creating Custom Shellcode](/guides/creating-shellcode)
+- [Debugging Your Code](/guides/debugging)
+- [Module Stomping](/guides/module-stomping)
