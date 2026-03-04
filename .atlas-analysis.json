@@ -1,0 +1,91 @@
+{
+  "projectType": "framework",
+  "projectName": "Stardust",
+  "projectDescription": "A modern 32/64-bit position independent shellcode template for Windows",
+  "theme": "aspen",
+  "primaryColor": "#9297aa",
+  "lightColor": "#282b38",
+  "darkColor": "#c7b8be",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "building"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/position-independence",
+              "concepts/string-obfuscation",
+              "concepts/api-resolution"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/adding-apis",
+              "guides/creating-shellcode",
+              "guides/module-stomping",
+              "guides/debugging"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/basic-messagebox",
+              "examples/loading-libraries",
+              "examples/advanced-techniques"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core APIs",
+            "pages": [
+              "api/resolve",
+              "api/hash",
+              "api/symbol",
+              "api/memory"
+            ]
+          },
+          {
+            "group": "Macros",
+            "pages": [
+              "api/macros"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Position-independent code for 32/64-bit Windows",
+    "Compile-time string hashing with FNV1a",
+    "Dynamic API resolution from PEB",
+    "Raw string support for shellcode",
+    "Debug mode with DbgPrint",
+    "Module stomping technique support"
+  ],
+  "publicApiSurface": [
+    "resolve::module() - Resolve module base address from PEB",
+    "resolve::api() - Resolve function pointer by hash",
+    "expr::hash_string() - Compile-time string hashing",
+    "symbol() - Access raw strings in PIC",
+    "RESOLVE_API() - Macro for convenient API resolution",
+    "RESOLVE_IMPORT() - Macro for batch import resolution",
+    "memory::zero() - Secure memory zeroing",
+    "memory::copy() - Memory copy operation",
+    "memory::compare() - Memory comparison"
+  ]
+}
